@@ -43,12 +43,30 @@ jobs:
       env:
         RUST_BACKTRACE: 1
 
-        - name: Extract version from tag
+    - name: Extract version from tag
       id: version
       run: |
         VERSION=${GITHUB_REF#refs/tags/}
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "Extracted version: $VERSION"
+
+    - name: Create release assets
+      run: |
+        # Create a zip file with the pkg directory contents
+        cd pkg
+        zip -r ../opfs-project-${{ steps.version.outputs.version }}.zip .
+        cd ..
+        echo "Created release asset: opfs-project-${{ steps.version.outputs.version }}.zip"
+
+    - name: Upload release assets
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ./opfs-project-${{ steps.version.outputs.version }}.zip
+        asset_name: opfs-project-${{ steps.version.outputs.version }}.zip
+        asset_content_type: application/zip
 
     - name: Update Cargo.toml version
       run: |
