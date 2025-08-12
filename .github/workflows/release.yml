@@ -7,6 +7,9 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
 
     steps:
     - name: Checkout code
@@ -60,7 +63,7 @@ jobs:
 
     - name: Upload release assets
       run: |
-        gh release upload ${{ steps.version.outputs.version }} opfs-project-${{ steps.version.outputs.version }}.zip
+        gh release upload ${{ steps.version.outputs.version }} opfs-project-${{ steps.version.outputs.version }}.zip --clobber
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
