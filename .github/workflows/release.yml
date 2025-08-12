@@ -59,14 +59,10 @@ jobs:
         echo "Created release asset: opfs-project-${{ steps.version.outputs.version }}.zip"
 
     - name: Upload release assets
-      uses: actions/upload-release-asset@v1
+      run: |
+        gh release upload ${{ steps.version.outputs.version }} opfs-project-${{ steps.version.outputs.version }}.zip
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./opfs-project-${{ steps.version.outputs.version }}.zip
-        asset_name: opfs-project-${{ steps.version.outputs.version }}.zip
-        asset_content_type: application/zip
 
     - name: Update Cargo.toml version
       run: |
