@@ -3,6 +3,15 @@ name = "opfs-project"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "A Rust library for working with the Origin Private File System (OPFS) in WebAssembly applications"
+repository = "https://github.com/utooland/opfs-project"
+homepage = "https://github.com/utooland/opfs-project"
+documentation = "https://docs.rs/opfs-project"
+keywords = ["wasm", "webassembly", "opfs", "file-system", "browser", "storage"]
+categories = ["wasm", "filesystem", "web-programming"]
+authors = ["elrrrrrrr <elrrrrrrr@gmail.com>"]
+readme = "README.md"
+exclude = [".gitignore", ".github/", "target/", "pkg/"]
 
 [dependencies]
 anyhow = "1.0.96"
