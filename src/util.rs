@@ -39,6 +39,7 @@ pub fn prepare_path(path: &str) -> String {
         path.to_string()
     } else {
         let cwd = crate::cwd::get_cwd();
+        let cwd = cwd.to_string_lossy();
         format!("{cwd}/{path}")
     }
 }
@@ -77,7 +78,6 @@ pub async fn read_dir_direct(path: &str) -> Result<Vec<DirEntry>> {
 mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
     use super::*;
-
 
     use wasm_bindgen_test::*;
 

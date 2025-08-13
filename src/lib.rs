@@ -2,13 +2,7 @@
 
 use anyhow::Result;
 
-use std::sync::Mutex;
-use std::sync::OnceLock;
 use wasm_bindgen::prelude::wasm_bindgen;
-
-// Global CWD static variable accessible to all modules
-// Maybe should not global in the future
-static CWD: OnceLock<Mutex<String>> = OnceLock::new();
 
 /// Directory entry with name and type information
 #[wasm_bindgen(inspectable)]
@@ -120,25 +114,15 @@ pub mod opfs {
 }
 
 pub mod cwd {
-    use super::*;
+    use std::path::PathBuf;
 
     /// Set current working directory
-    pub fn set_cwd(path: String) {
-        if let Some(cwd) = CWD.get() {
-            let mut guard = cwd.lock().unwrap();
-            *guard = path.to_string();
-        } else {
-            CWD.get_or_init(|| Mutex::new(path));
-        }
+    pub fn set_cwd(path: PathBuf) {
+        tokio_fs_ext::set_current_dir(path).unwrap();
     }
 
     /// Read current working directory
-    pub fn get_cwd() -> String {
-        if let Some(cwd) = CWD.get() {
-            cwd.lock().unwrap().clone()
-        } else {
-            let cwd = CWD.get_or_init(|| Mutex::new(String::from("/")));
-            cwd.lock().unwrap().clone()
-        }
+    pub fn get_cwd() -> PathBuf {
+        tokio_fs_ext::current_dir().unwrap()
     }
 }
