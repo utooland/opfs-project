@@ -790,6 +790,7 @@ dependencies = [
  "tar",
  "tokio-fs-ext",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
 ]

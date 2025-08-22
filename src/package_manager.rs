@@ -1,12 +1,17 @@
 use anyhow::Result;
 use flate2::read::GzDecoder;
-use futures::future::join_all;
 use std::io::Read;
 use tar::Archive;
 
 use super::fuse;
 use super::opfs;
 use crate::package_lock::PackageLock;
+
+#[cfg(not(feature = "threads"))]
+use futures::future::join_all;
+
+#[cfg(feature = "threads")]
+use wasm_bindgen_futures::spawn_local;
 
 /// Download all tgz packages to OPFS
 pub async fn install_deps(package_lock: &str) -> Result<Vec<String>> {
@@ -16,24 +21,41 @@ pub async fn install_deps(package_lock: &str) -> Result<Vec<String>> {
     // Write package.json to root
     ensure_package_json(&project_name, &lock).await?;
 
-    // Prepare tasks for parallel execution
-    let tasks: Vec<_> = lock
-        .packages
-        .iter()
-        .filter(|(path, _)| !path.is_empty())
-        .map(|(path, pkg)| {
-            let name = pkg.get_name(path);
-            let version = pkg.get_version();
-            let tgz_url = pkg.resolved.clone();
-            let project_name = project_name.clone();
+    #[cfg(not(feature = "threads"))]
+    {
+        // Prepare tasks for parallel execution using join_all
+        let tasks: Vec<_> = lock
+            .packages
+            .iter()
+            .filter(|(path, _)| !path.is_empty())
+            .map(|(path, pkg)| {
+                let name = pkg.get_name(path);
+                let version = pkg.get_version();
+                let tgz_url = pkg.resolved.clone();
+                let project_name = project_name.clone();
 
-            async move { install_single_package(&name, &version, &tgz_url, &project_name).await }
-        })
-        .collect();
+                async move { install_single_package(&name, &version, &tgz_url, &project_name).await }
+            })
+            .collect();
 
-    // Run all tasks in parallel and collect results
-    let results = join_all(tasks).await;
-    Ok(results)
+        // Run all tasks in parallel and collect results
+        let results = join_all(tasks).await;
+        Ok(results)
+    }
+
+    #[cfg(feature = "threads")]
+    {
+        // Get packages that need installation
+        let packages: Vec<_> = lock
+            .packages
+            .iter()
+            .filter(|(path, _)| !path.is_empty())
+            .collect();
+
+        // Use spawn_local for concurrent execution
+        let results = install_packages_with_spawn(packages, &project_name).await;
+        Ok(results)
+    }
 }
 
 /// Write root package.json to the project directory
@@ -48,6 +70,49 @@ async fn ensure_package_json(project_name: &str, lock: &PackageLock) -> Result<(
         opfs::write(&format!("{project_name}/package.json"), &pkg_json).await?;
     }
     Ok(())
+}
+
+
+
+#[cfg(feature = "threads")]
+/// Install packages using spawn_local for concurrent execution
+async fn install_packages_with_spawn(
+    packages: Vec<(&String, &crate::package_lock::LockPackage)>,
+    project_name: &str,
+) -> Vec<String> {
+    use futures::channel::oneshot;
+
+    let mut handles = Vec::new();
+
+    for (path, pkg) in packages {
+        let name = pkg.get_name(path);
+        let version = pkg.get_version();
+        let tgz_url = pkg.resolved.clone();
+        let project_name = project_name.to_string();
+
+        // Create a channel for getting the result
+        let (tx, rx) = oneshot::channel();
+
+        // Spawn the task using spawn_local
+        spawn_local(async move {
+            let result = install_single_package(&name, &version, &tgz_url, &project_name).await;
+
+            // Send result back through the channel
+            let _ = tx.send(result);
+        });
+
+        handles.push(rx);
+    }
+
+    // Collect all results
+    let mut final_results = Vec::new();
+    for handle in handles {
+        if let Ok(result) = handle.await {
+            final_results.push(result);
+        }
+    }
+
+    final_results
 }
 
 /// Install a single package
