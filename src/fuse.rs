@@ -1,41 +1,12 @@
 use crate::util::get_package_name;
-use std::io::{Result, Error, ErrorKind};
+use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 
-/// Read file content with fuse.link support
-pub async fn read<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
-    let path_ref = path.as_ref();
-    let prepared_path = crate::util::prepare_path(path_ref);
-
-    // Try to read through node_modules fuse link logic first
-    if let Some(content) = try_read_through_fuse_link(&prepared_path).await? {
-        return Ok(content);
-    }
-
-    // Fallback to direct read
+/// Read file content as bytes (without fuse.link support)
+pub(crate) async fn read_without_fuse_link(path: &str) -> Result<Vec<u8>> {
+    let prepared_path = crate::util::prepare_path(path);
     let content = tokio_fs_ext::read(&prepared_path).await?;
     Ok(content)
-}
-
-/// Read directory contents with file type information and fuse.link support
-pub async fn read_dir<P: AsRef<Path>>(path: P) -> Result<Vec<crate::DirEntry>> {
-    let path_ref = path.as_ref();
-    let prepared_path = crate::util::prepare_path(path_ref);
-
-    // Handle node_modules fuse.link logic
-    if let Some(entries) = try_read_dir_through_fuse_link(&prepared_path).await? {
-        return Ok(entries);
-    }
-
-    // Handle direct directory reading
-    let entries = crate::util::read_dir_direct(&prepared_path).await?;
-
-    // Handle single fuse.link file case
-    if let Some(entries) = try_read_dir_through_single_fuse_link(&prepared_path, &entries).await? {
-        return Ok(entries);
-    }
-
-    Ok(entries)
 }
 
 /// Create fuse link between source and destination directories
@@ -95,7 +66,9 @@ fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<std::path::PathBuf> {
 }
 
 /// Try to read file through fuse link logic for node_modules
-async fn try_read_through_fuse_link<P: AsRef<Path>>(prepared_path: P) -> Result<Option<Vec<u8>>> {
+pub(super) async fn try_read_through_fuse_link<P: AsRef<Path>>(
+    prepared_path: P,
+) -> Result<Option<Vec<u8>>> {
     let path_ref = prepared_path.as_ref();
     let path_str = path_ref.to_string_lossy();
 
@@ -135,9 +108,12 @@ fn extract_relative_path_from_node_modules<P: AsRef<Path>>(prepared_path: P) -> 
     let package_name = get_package_name(&path_str)
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Could not extract package name"))?;
 
-    let node_modules_pos = path_str
-        .find("node_modules")
-        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Could not find node_modules in path"))?;
+    let node_modules_pos = path_str.find("node_modules").ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "Could not find node_modules in path",
+        )
+    })?;
 
     // Get the part after node_modules/package_name/
     let after_package = &path_str[node_modules_pos + "node_modules".len()..];
@@ -160,9 +136,9 @@ fn extract_relative_path_from_node_modules<P: AsRef<Path>>(prepared_path: P) -> 
 }
 
 /// Try to read directory through fuse.link for node_modules
-async fn try_read_dir_through_fuse_link<P: AsRef<Path>>(
+pub(super) async fn try_read_dir_through_fuse_link<P: AsRef<Path>>(
     prepared_path: P,
-) -> Result<Option<Vec<crate::DirEntry>>> {
+) -> Result<Option<Vec<tokio_fs_ext::DirEntry>>> {
     let path_ref = prepared_path.as_ref();
     let path_str = path_ref.to_string_lossy();
 
@@ -191,7 +167,10 @@ async fn try_read_dir_through_fuse_link<P: AsRef<Path>>(
 }
 
 /// Get target path for node_modules directory
-fn get_target_path_for_node_modules<P: AsRef<Path>, T: AsRef<Path>>(prepared_path: P, target_dir: T) -> Result<std::path::PathBuf> {
+fn get_target_path_for_node_modules<P: AsRef<Path>, T: AsRef<Path>>(
+    prepared_path: P,
+    target_dir: T,
+) -> Result<std::path::PathBuf> {
     let path_ref = prepared_path.as_ref();
     let path_str = path_ref.to_string_lossy();
     let target_dir_ref = target_dir.as_ref();
@@ -216,10 +195,10 @@ fn get_target_path_for_node_modules<P: AsRef<Path>, T: AsRef<Path>>(prepared_pat
 }
 
 /// Try to read directory through single fuse.link file
-async fn try_read_dir_through_single_fuse_link<P: AsRef<Path>>(
+pub(super) async fn try_read_dir_through_single_fuse_link<P: AsRef<Path>>(
     prepared_path: P,
-    entries: &[crate::DirEntry],
-) -> Result<Option<Vec<crate::DirEntry>>> {
+    entries: &[tokio_fs_ext::DirEntry],
+) -> Result<Option<Vec<tokio_fs_ext::DirEntry>>> {
     // Check if entries only contains one entry and it is fuse.link
     if entries.len() != 1 || entries[0].file_name().to_string_lossy() != "fuse.link" {
         return Ok(None);
@@ -242,7 +221,6 @@ async fn try_read_dir_through_single_fuse_link<P: AsRef<Path>>(
 mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
     use super::*;
-
 
     use wasm_bindgen_test::*;
 
@@ -293,7 +271,12 @@ mod tests {
 
         // Create source directory
         tokio_fs_ext::create_dir_all(src_path).await.unwrap();
-        tokio_fs_ext::write(&format!("{}/test.txt", src_path), "Source content".as_bytes()).await.unwrap();
+        tokio_fs_ext::write(
+            &format!("{}/test.txt", src_path),
+            "Source content".as_bytes(),
+        )
+        .await
+        .unwrap();
 
         // Create fuse link
         let result = fuse_link(src_path, &dst_path).await;
@@ -431,12 +414,9 @@ mod tests {
         // Create a subdirectory in the source
         let source_subdir = Path::new(&base_path).join("subdir");
         tokio_fs_ext::create_dir_all(&source_subdir).await.unwrap();
-        tokio_fs_ext::write(
-            &source_subdir.join("subfile.txt"),
-            b"Subdirectory file",
-        )
-        .await
-        .unwrap();
+        tokio_fs_ext::write(&source_subdir.join("subfile.txt"), b"Subdirectory file")
+            .await
+            .unwrap();
 
         // Test reading directory through fuse link
         let result = try_read_dir_through_fuse_link(&package_path).await.unwrap();
@@ -446,13 +426,14 @@ mod tests {
         assert!(!entries.is_empty());
 
         // Verify we can find the test files
-        let file_names: Vec<String> = entries.iter().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        let file_names: Vec<String> = entries
+            .iter()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
         assert!(file_names.contains(&"test.txt".to_string()));
         assert!(file_names.contains(&"package.json".to_string()));
         assert!(file_names.contains(&"subdir".to_string()));
     }
-
-
 
     #[wasm_bindgen_test]
     async fn test_get_target_path_for_node_modules() {
@@ -508,7 +489,10 @@ mod tests {
         let result = read_dir(&package_path).await.unwrap();
 
         assert!(!result.is_empty());
-        let file_names: Vec<String> = result.iter().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        let file_names: Vec<String> = result
+            .iter()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
         assert!(file_names.contains(&"test.txt".to_string()));
         assert!(file_names.contains(&"package.json".to_string()));
     }
@@ -530,7 +514,10 @@ mod tests {
         let result = read_dir(&base_path).await.unwrap();
 
         assert!(!result.is_empty());
-        let file_names: Vec<String> = result.iter().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        let file_names: Vec<String> = result
+            .iter()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
         assert!(file_names.contains(&"test.txt".to_string()));
         assert!(file_names.contains(&"package.json".to_string()));
     }

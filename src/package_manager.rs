@@ -1,7 +1,7 @@
-use std::io::Result;
 use flate2::read::GzDecoder;
 use futures::future::join_all;
 use std::io::Read;
+use std::io::Result;
 use tar::Archive;
 
 use super::fuse;
@@ -38,7 +38,10 @@ pub async fn install_deps(package_lock: &str) -> Result<Vec<String>> {
 
 /// Write root package.json to the project directory
 async fn ensure_package_json(project_name: &str, lock: &PackageLock) -> Result<()> {
-    if tokio_fs_ext::metadata(&format!("{project_name}/package.json")).await.is_ok() {
+    if tokio_fs_ext::metadata(&format!("{project_name}/package.json"))
+        .await
+        .is_ok()
+    {
         return Ok(());
     }
 
@@ -94,7 +97,7 @@ async fn install_package(
 /// Get or download tgz file
 async fn get_or_download_tgz(tgz_url: &str, tgz_store_path: &str) -> Result<Vec<u8>> {
     if tokio_fs_ext::metadata(tgz_store_path).await.is_ok() {
-        crate::read_without_fuse_link(tgz_store_path).await
+        super::fuse::read_without_fuse_link(tgz_store_path).await
     } else {
         let bytes = download_bytes(tgz_url).await?;
         save_tgz(tgz_store_path, &bytes).await?;
@@ -126,11 +129,16 @@ impl PackagePaths {
 pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &str) -> Result<()> {
     let gz = GzDecoder::new(tgz_bytes);
     let mut archive = Archive::new(gz);
-    let entries = archive.entries().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let entries = archive
+        .entries()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     for entry in entries {
-        let mut entry = entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let path = entry.path().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut entry =
+            entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let path = entry
+            .path()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let path_str = path.to_string_lossy().to_string();
 
         // Remove the first-level "package" directory if present
@@ -145,7 +153,9 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &str) -> Result<()
 
         if entry.header().entry_type().is_file() {
             let mut contents = Vec::new();
-            entry.read_to_end(&mut contents).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            entry
+                .read_to_end(&mut contents)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             // Write the file to the output path
             save_tgz(&out_path, &contents).await?;
         }
@@ -166,8 +176,13 @@ async fn save_tgz(path: &str, bytes: &[u8]) -> Result<()> {
 
 /// Download bytes from URL
 async fn download_bytes(url: &str) -> Result<Vec<u8>> {
-    let response = reqwest::get(url).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let bytes = response.bytes().await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let response = reqwest::get(url)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NetworkUnreachable, e))?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NetworkUnreachable, e))?;
     Ok(bytes.to_vec())
 }
 #[cfg(test)]
@@ -175,7 +190,6 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
     use super::*;
     use crate::package_lock::{LockPackage, PackageLock};
-
 
     use wasm_bindgen_test::*;
 
@@ -283,7 +297,8 @@ mod tests {
 
         // Verify files were extracted
         let entries = crate::read_dir(&extract_dir).await.unwrap();
-        let file_names: Vec<String> = entries.iter()
+        let file_names: Vec<String> = entries
+            .iter()
             .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
             .collect();
 
@@ -304,7 +319,8 @@ mod tests {
 
         // Verify files were extracted without package/ prefix
         let entries = crate::read_dir(&extract_dir).await.unwrap();
-        let file_names: Vec<String> = entries.iter()
+        let file_names: Vec<String> = entries
+            .iter()
             .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
             .collect();
 
@@ -313,8 +329,11 @@ mod tests {
         assert!(!file_names.contains(&"package".to_string()));
 
         // Check that src is a directory and contains main.js
-        let src_entries = crate::read_dir(&format!("{}/src", extract_dir)).await.unwrap();
-        let src_file_names: Vec<String> = src_entries.iter()
+        let src_entries = crate::read_dir(&format!("{}/src", extract_dir))
+            .await
+            .unwrap();
+        let src_file_names: Vec<String> = src_entries
+            .iter()
             .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
             .collect();
         assert!(src_file_names.contains(&"main.js".to_string()));
