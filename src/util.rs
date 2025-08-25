@@ -49,14 +49,8 @@ pub fn prepare_path<P: AsRef<Path>>(path: P) -> std::path::PathBuf {
 /// Read directory directly without fuse.link logic
 pub async fn read_dir_direct<P: AsRef<Path>>(path: P) -> Result<Vec<tokio_fs_ext::DirEntry>> {
     let path_ref = path.as_ref();
-    let mut entries = Vec::new();
-    let mut read_dir = tokio_fs_ext::read_dir(path_ref).await?;
-
-    while let Some(entry) = read_dir.next_entry().await? {
-        entries.push(entry);
-    }
-
-    Ok(entries)
+    let read_dir = tokio_fs_ext::read_dir(path_ref).await?;
+    read_dir.collect()
 }
 
 #[cfg(test)]

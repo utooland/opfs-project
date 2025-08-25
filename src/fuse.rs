@@ -18,7 +18,7 @@ pub async fn read<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
 }
 
 /// Read directory contents with file type information and fuse.link support
-pub async fn read_dir<P: AsRef<Path>>(path: P) -> Result<Vec<tokio_fs_ext::DirEntry>> {
+pub async fn read_dir<P: AsRef<Path>>(path: P) -> Result<Vec<crate::DirEntry>> {
     let path_ref = path.as_ref();
     let prepared_path = crate::util::prepare_path(path_ref);
 
@@ -46,7 +46,7 @@ pub async fn fuse_link<S: AsRef<Path>, D: AsRef<Path>>(src: S, dst: D) -> Result
     // Create the destination directory if it doesn't exist
     tokio_fs_ext::create_dir_all(dst_ref.to_string_lossy().as_ref()).await?;
 
-    let link_file_path = format!("{}/fuse.link", dst_ref.to_string_lossy());
+    let link_file_path = dst_ref.join("fuse.link");
 
     // Check if fuse.link already exists
     if tokio_fs_ext::metadata(&link_file_path).await.is_ok() {
@@ -84,10 +84,11 @@ fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<std::path::PathBuf> {
         if let Some(node_modules_pos) = path_str.find("node_modules") {
             // Construct the path: original_path_up_to_node_modules/node_modules/package_name/fuse.link
             let before_node_modules = &path_str[..node_modules_pos];
-            let fuse_link_path = format!(
-                "{before_node_modules}/node_modules/{package_name}/fuse.link"
-            );
-            return Some(std::path::PathBuf::from(fuse_link_path));
+            let fuse_link_path = Path::new(before_node_modules)
+                .join("node_modules")
+                .join(package_name)
+                .join("fuse.link");
+            return Some(fuse_link_path);
         }
     }
     None
@@ -118,7 +119,7 @@ async fn try_read_through_fuse_link<P: AsRef<Path>>(prepared_path: P) -> Result<
     }
 
     let relative_path = extract_relative_path_from_node_modules(path_ref)?;
-    let target_path = format!("{}/{}", target_dir, relative_path);
+    let target_path = Path::new(target_dir).join(relative_path);
 
     match tokio_fs_ext::read(&target_path).await {
         Ok(content) => Ok(Some(content)),
@@ -217,19 +218,10 @@ fn get_target_path_for_node_modules<P: AsRef<Path>, T: AsRef<Path>>(prepared_pat
 /// Try to read directory through single fuse.link file
 async fn try_read_dir_through_single_fuse_link<P: AsRef<Path>>(
     prepared_path: P,
-    entries: &[tokio_fs_ext::DirEntry],
-) -> Result<Option<Vec<tokio_fs_ext::DirEntry>>> {
+    entries: &[crate::DirEntry],
+) -> Result<Option<Vec<crate::DirEntry>>> {
     // Check if entries only contains one entry and it is fuse.link
-    if entries.len() != 1 {
-        return Ok(None);
-    }
-
-    let first_entry = &entries[0];
-    if let Some(name) = first_entry.file_name().to_str() {
-        if name != "fuse.link" {
-            return Ok(None);
-        }
-    } else {
+    if entries.len() != 1 || entries[0].file_name().to_string_lossy() != "fuse.link" {
         return Ok(None);
     }
 
@@ -276,21 +268,21 @@ mod tests {
 
     /// Test helper: create a node_modules structure
     async fn create_node_modules_structure(base_path: &str, package_name: &str) -> String {
-        let node_modules_path = format!("{}/node_modules", base_path);
-        let package_path = format!("{}/{}", node_modules_path, package_name);
+        let node_modules_path = Path::new(base_path).join("node_modules");
+        let package_path = node_modules_path.join(package_name);
 
         tokio_fs_ext::create_dir_all(&package_path).await.unwrap();
 
         // Create fuse.link file
         let fuse_link_content = format!("{}\n", base_path);
         tokio_fs_ext::write(
-            &format!("{}/fuse.link", package_path),
+            &package_path.join("fuse.link"),
             fuse_link_content.as_bytes(),
         )
         .await
         .unwrap();
 
-        package_path
+        package_path.to_string_lossy().to_string()
     }
 
     #[wasm_bindgen_test]
@@ -308,7 +300,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify fuse.link file was created
-        let link_file_path = format!("{}/fuse.link", dst_path);
+        let link_file_path = Path::new(&dst_path).join("fuse.link");
         let content = crate::read(&link_file_path).await.unwrap();
         let link_content = String::from_utf8(content).unwrap();
         assert_eq!(link_content.trim(), src_path);
@@ -327,7 +319,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify both sources are in fuse.link
-        let link_file_path = format!("{}/fuse.link", dst_path);
+        let link_file_path = Path::new(&dst_path).join("fuse.link");
         let content = crate::read(&link_file_path).await.unwrap();
         let link_content = String::from_utf8(content).unwrap();
         let lines: Vec<&str> = link_content.lines().collect();
@@ -399,13 +391,13 @@ mod tests {
         let package_path = create_node_modules_structure(&base_path, package_name).await;
 
         // Create a file in the source directory
-        let source_file = format!("{}/source_file.txt", base_path);
+        let source_file = Path::new(&base_path).join("source_file.txt");
         tokio_fs_ext::write(&source_file, b"Fuse link content")
             .await
             .unwrap();
 
         // Test reading through fuse link
-        let node_modules_file = format!("{}/source_file.txt", package_path);
+        let node_modules_file = Path::new(&package_path).join("source_file.txt");
         let result = try_read_through_fuse_link(&node_modules_file)
             .await
             .unwrap();
@@ -437,10 +429,10 @@ mod tests {
         let package_path = create_node_modules_structure(&base_path, package_name).await;
 
         // Create a subdirectory in the source
-        let source_subdir = format!("{}/subdir", base_path);
+        let source_subdir = Path::new(&base_path).join("subdir");
         tokio_fs_ext::create_dir_all(&source_subdir).await.unwrap();
         tokio_fs_ext::write(
-            &format!("{}/subfile.txt", source_subdir),
+            &source_subdir.join("subfile.txt"),
             b"Subdirectory file",
         )
         .await
@@ -454,9 +446,7 @@ mod tests {
         assert!(!entries.is_empty());
 
         // Verify we can find the test files
-        let file_names: Vec<String> = entries.iter()
-            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
-            .collect();
+        let file_names: Vec<String> = entries.iter().map(|e| e.file_name().to_string_lossy().to_string()).collect();
         assert!(file_names.contains(&"test.txt".to_string()));
         assert!(file_names.contains(&"package.json".to_string()));
         assert!(file_names.contains(&"subdir".to_string()));
@@ -496,13 +486,13 @@ mod tests {
         let package_path = create_node_modules_structure(&base_path, package_name).await;
 
         // Create a file in the source directory
-        let source_file = format!("{}/fuse_test.txt", base_path);
+        let source_file = Path::new(&base_path).join("fuse_test.txt");
         tokio_fs_ext::write(&source_file, b"Fuse link test content")
             .await
             .unwrap();
 
         // Test reading through the main read function
-        let node_modules_file = format!("{}/fuse_test.txt", package_path);
+        let node_modules_file = Path::new(&package_path).join("fuse_test.txt");
         let result = read(&node_modules_file).await.unwrap();
 
         assert_eq!(result, b"Fuse link test content");
@@ -518,9 +508,7 @@ mod tests {
         let result = read_dir(&package_path).await.unwrap();
 
         assert!(!result.is_empty());
-        let file_names: Vec<String> = result.iter()
-            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
-            .collect();
+        let file_names: Vec<String> = result.iter().map(|e| e.file_name().to_string_lossy().to_string()).collect();
         assert!(file_names.contains(&"test.txt".to_string()));
         assert!(file_names.contains(&"package.json".to_string()));
     }
@@ -530,7 +518,7 @@ mod tests {
         let base_path = create_test_dir("test-read-regular-file").await;
 
         // Test reading a regular file (not in node_modules)
-        let result = read(&format!("{}/test.txt", base_path)).await.unwrap();
+        let result = read(&Path::new(&base_path).join("test.txt")).await.unwrap();
         assert_eq!(result, b"Hello, World!");
     }
 
@@ -542,9 +530,7 @@ mod tests {
         let result = read_dir(&base_path).await.unwrap();
 
         assert!(!result.is_empty());
-        let file_names: Vec<String> = result.iter()
-            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
-            .collect();
+        let file_names: Vec<String> = result.iter().map(|e| e.file_name().to_string_lossy().to_string()).collect();
         assert!(file_names.contains(&"test.txt".to_string()));
         assert!(file_names.contains(&"package.json".to_string()));
     }

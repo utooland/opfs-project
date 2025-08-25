@@ -408,9 +408,6 @@ mod tests {
         tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
 
         let results = install_deps(&lock_json).await;
-        if let Err(ref e) = results {
-            web_sys::console::log_1(&format!("Error in install_deps: {:?}", e).into());
-        }
         assert!(results.is_ok());
 
         let results = results.unwrap();
@@ -435,10 +432,6 @@ mod tests {
 
         // Try to write to a file
         let result = tokio_fs_ext::write(test_file, content).await;
-
-        if let Err(ref e) = result {
-            web_sys::console::log_1(&format!("Error in opfs::write: {:?}", e).into());
-        }
 
         assert!(result.is_ok());
     }
