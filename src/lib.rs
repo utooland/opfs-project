@@ -50,16 +50,6 @@ pub async fn read_dir<P: AsRef<Path>>(path: P) -> Result<Vec<tokio_fs_ext::DirEn
     Ok(entries)
 }
 
-/// Set current working directory
-pub fn set_cwd(path: impl AsRef<Path>) {
-    tokio_fs_ext::set_current_dir(path).unwrap();
-}
-
-/// Read current working directory
-pub fn get_cwd() -> PathBuf {
-    tokio_fs_ext::current_dir().unwrap()
-}
-
 pub async fn write(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> Result<()> {
     // TODO: try fuse link first
     tokio_fs_ext::write(path, content).await
@@ -98,4 +88,14 @@ pub async fn remove_dir_all(path: impl AsRef<Path>) -> Result<()> {
 pub async fn metadata(path: impl AsRef<Path>) -> Result<tokio_fs_ext::Metadata> {
     // TODO: try fuse link first
     tokio_fs_ext::metadata(path).await
+}
+
+/// Set current working directory
+pub fn set_cwd(path: impl AsRef<Path>) {
+    tokio_fs_ext::set_current_dir(path).unwrap();
+}
+
+/// Read current working directory
+pub fn get_cwd() -> PathBuf {
+    tokio_fs_ext::current_dir().unwrap()
 }

@@ -254,7 +254,8 @@ mod tests {
         // Should have at least 3 entries (file1.txt, file2.js, subdir)
         assert!(entries.len() >= 3);
 
-        let file_names: Vec<String> = entries.iter()
+        let file_names: Vec<String> = entries
+            .iter()
             .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
             .collect();
 
@@ -318,7 +319,10 @@ mod tests {
 
         let entries = read_dir_direct(&temp_path).await.unwrap();
 
-        let file_names: Vec<String> = entries.iter().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        let file_names: Vec<String> = entries
+            .iter()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
 
         // Should include both visible and hidden files
         assert!(file_names.contains(&"visible.txt".to_string()));
@@ -347,7 +351,10 @@ mod tests {
 
         let entries = read_dir_direct(&temp_path).await.unwrap();
 
-        let file_names: Vec<String> = entries.iter().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        let file_names: Vec<String> = entries
+            .iter()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
 
         assert!(file_names.contains(&"file with spaces.txt".to_string()));
         assert!(file_names.contains(&"file-with-dashes.js".to_string()));
