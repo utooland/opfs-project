@@ -39,14 +39,6 @@ pub async fn read_dir<P: AsRef<Path>>(path: P) -> Result<Vec<tokio_fs_ext::DirEn
 
     // Handle direct directory reading
     let entries = crate::util::read_dir_direct(&prepared_path).await?;
-
-    // Handle single fuse.link file case
-    if let Some(entries) =
-        fuse::try_read_dir_through_single_fuse_link(&prepared_path, &entries).await?
-    {
-        return Ok(entries);
-    }
-
     Ok(entries)
 }
 

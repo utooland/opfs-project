@@ -2,6 +2,7 @@ use flate2::read::GzDecoder;
 use futures::future::join_all;
 use std::io::Read;
 use std::io::Result;
+use std::path::PathBuf;
 use tar::Archive;
 
 use super::fuse;
@@ -26,8 +27,9 @@ pub async fn install_deps(package_lock: &str) -> Result<Vec<String>> {
             let version = pkg.get_version();
             let tgz_url = pkg.resolved.clone();
             let project_name = project_name.clone();
+            let path_key = path.clone();
 
-            async move { install_single_package(&name, &version, &tgz_url, &project_name).await }
+            async move { install_package(&name, &version, &tgz_url, &project_name, &path_key).await }
         })
         .collect();
 
@@ -53,51 +55,49 @@ async fn ensure_package_json(project_name: &str, lock: &PackageLock) -> Result<(
     Ok(())
 }
 
-/// Install a single package
-async fn install_single_package(
+/// Install package using the provided URL
+async fn install_package(
     name: &str,
     version: &str,
     tgz_url: &Option<String>,
     project_name: &str,
+    path_key: &str,
 ) -> String {
     match tgz_url {
-        Some(url) => match install_package(name, version, url, project_name).await {
-            Ok(_) => format!("{name}@{version}: installed successfully"),
-            Err(e) => format!("{name}@{version}: {e}"),
-        },
+        Some(url) => {
+            let paths = PackagePaths::new(name, url, project_name, path_key);
+
+            // Check if already unpacked
+            if tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_ok() {
+                match fuse::fuse_link(&paths.unpacked_dir, &paths.link_target_dir).await {
+                    Ok(_) => format!("{name}@{version}: installed successfully"),
+                    Err(e) => format!("{name}@{version}: {e}"),
+                }
+            } else {
+                // Get or download tgz bytes
+                match get_or_download_tgz(url, &paths.tgz_store_path).await {
+                    Ok(tgz_bytes) => {
+                        // Extract and create fuse link
+                        match extract_tgz_bytes(&tgz_bytes, &paths.unpacked_dir).await {
+                            Ok(_) => match fuse::fuse_link(&paths.unpacked_dir, &paths.link_target_dir).await {
+                                Ok(_) => format!("{name}@{version}: installed successfully"),
+                                Err(e) => format!("{name}@{version}: {e}"),
+                            },
+                            Err(e) => format!("{name}@{version}: {e}"),
+                        }
+                    }
+                    Err(e) => format!("{name}@{version}: {e}"),
+                }
+            }
+        }
         None => format!("{name}@{version}: no resolved field"),
     }
 }
 
-/// Install package using the provided URL
-async fn install_package(
-    name: &str,
-    _version: &str,
-    tgz_url: &str,
-    project_name: &str,
-) -> Result<()> {
-    let paths = PackagePaths::new(name, tgz_url, project_name);
-
-    // Check if already unpacked
-    if tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_ok() {
-        fuse::fuse_link(&paths.unpacked_dir, &paths.unpack_dir).await?;
-        return Ok(());
-    }
-
-    // Get or download tgz bytes
-    let tgz_bytes = get_or_download_tgz(tgz_url, &paths.tgz_store_path).await?;
-
-    // Extract and create fuse link
-    extract_tgz_bytes(&tgz_bytes, &paths.unpacked_dir).await?;
-    fuse::fuse_link(&paths.unpacked_dir, &paths.unpack_dir).await?;
-
-    Ok(())
-}
-
 /// Get or download tgz file
-async fn get_or_download_tgz(tgz_url: &str, tgz_store_path: &str) -> Result<Vec<u8>> {
+async fn get_or_download_tgz(tgz_url: &str, tgz_store_path: &PathBuf) -> Result<Vec<u8>> {
     if tokio_fs_ext::metadata(tgz_store_path).await.is_ok() {
-        super::fuse::read_without_fuse_link(tgz_store_path).await
+        super::util::read_direct(tgz_store_path).await
     } else {
         let bytes = download_bytes(tgz_url).await?;
         save_tgz(tgz_store_path, &bytes).await?;
@@ -107,26 +107,26 @@ async fn get_or_download_tgz(tgz_url: &str, tgz_store_path: &str) -> Result<Vec<
 
 /// Package paths for installation
 struct PackagePaths {
-    tgz_store_path: String,
-    unpacked_dir: String,
-    unpack_dir: String,
+    tgz_store_path: PathBuf,
+    unpacked_dir: PathBuf,
+    link_target_dir: PathBuf,
 }
 
 impl PackagePaths {
-    fn new(name: &str, tgz_url: &str, project_name: &str) -> Self {
+    fn new(name: &str, tgz_url: &str, project_name: &str, path_key: &str) -> Self {
         let url_path: Vec<_> = tgz_url.split('/').collect();
         let tgz_file_name = url_path.last().unwrap_or(&"package.tgz");
 
         Self {
-            tgz_store_path: format!("/stores/{name}/-/{tgz_file_name}"),
-            unpacked_dir: format!("/stores/{name}/-/{tgz_file_name}-unpack"),
-            unpack_dir: format!("{project_name}/node_modules/{name}"),
+            tgz_store_path: PathBuf::from(format!("/stores/{name}/-/{tgz_file_name}")),
+            unpacked_dir: PathBuf::from(format!("/stores/{name}/-/{tgz_file_name}-unpack")),
+            link_target_dir: PathBuf::from(format!("/{project_name}/{path_key}")),
         }
     }
 }
 
 /// Extract tgz bytes to directory
-pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &str) -> Result<()> {
+pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Result<()> {
     let gz = GzDecoder::new(tgz_bytes);
     let mut archive = Archive::new(gz);
     let entries = archive
@@ -143,12 +143,12 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &str) -> Result<()
 
         // Remove the first-level "package" directory if present
         let out_path = if let Some(stripped) = path_str.strip_prefix("package/") {
-            format!("{extract_dir}/{stripped}")
+            extract_dir.join(stripped)
         } else if path_str == "package" {
             // Skip the root package directory
             continue;
         } else {
-            format!("{extract_dir}/{path_str}")
+            extract_dir.join(path_str)
         };
 
         if entry.header().entry_type().is_file() {
@@ -164,9 +164,9 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &str) -> Result<()
 }
 
 /// Write bytes to file
-async fn save_tgz(path: &str, bytes: &[u8]) -> Result<()> {
+async fn save_tgz(path: &PathBuf, bytes: &[u8]) -> Result<()> {
     // Create parent directory if it doesn't exist
-    if let Some(parent_dir) = std::path::Path::new(path).parent()
+    if let Some(parent_dir) = path.parent()
         && let Some(parent_str) = parent_dir.to_str()
     {
         tokio_fs_ext::create_dir_all(parent_str).await?;
@@ -255,14 +255,15 @@ mod tests {
             "lodash",
             "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
             "test-project",
+            "node_modules/lodash",
         );
 
-        assert_eq!(paths.tgz_store_path, "/stores/lodash/-/lodash-4.17.21.tgz");
+        assert_eq!(paths.tgz_store_path.to_string_lossy(), "/stores/lodash/-/lodash-4.17.21.tgz");
         assert_eq!(
-            paths.unpacked_dir,
+            paths.unpacked_dir.to_string_lossy(),
             "/stores/lodash/-/lodash-4.17.21.tgz-unpack"
         );
-        assert_eq!(paths.unpack_dir, "test-project/node_modules/lodash");
+        assert_eq!(paths.link_target_dir.to_string_lossy(), "/test-project/node_modules/lodash");
     }
 
     #[wasm_bindgen_test]
@@ -271,22 +272,23 @@ mod tests {
             "@types/node",
             "https://registry.npmjs.org/@types/node/-/node-18.0.0.tgz",
             "my-project",
+            "node_modules/@types/node",
         );
 
         assert_eq!(
-            paths.tgz_store_path,
+            paths.tgz_store_path.to_string_lossy(),
             "/stores/@types/node/-/node-18.0.0.tgz"
         );
         assert_eq!(
-            paths.unpacked_dir,
+            paths.unpacked_dir.to_string_lossy(),
             "/stores/@types/node/-/node-18.0.0.tgz-unpack"
         );
-        assert_eq!(paths.unpack_dir, "my-project/node_modules/@types/node");
+        assert_eq!(paths.link_target_dir.to_string_lossy(), "/my-project/node_modules/@types/node");
     }
 
     #[wasm_bindgen_test]
     async fn test_extract_tgz_bytes_simple() {
-        let extract_dir = "/test-extract-simple".to_string();
+        let extract_dir = PathBuf::from("/test-extract-simple");
         tokio_fs_ext::create_dir_all(&extract_dir).await.unwrap();
 
         // Create a simple tar.gz with test content
@@ -308,7 +310,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_extract_tgz_bytes_with_package_prefix() {
-        let extract_dir = "/test-extract-prefix".to_string();
+        let extract_dir = PathBuf::from("/test-extract-prefix");
         tokio_fs_ext::create_dir_all(&extract_dir).await.unwrap();
 
         // Create a tar.gz with package/ prefix
@@ -329,7 +331,7 @@ mod tests {
         assert!(!file_names.contains(&"package".to_string()));
 
         // Check that src is a directory and contains main.js
-        let src_entries = crate::read_dir(&format!("{}/src", extract_dir))
+        let src_entries = crate::read_dir(&format!("{}/src", extract_dir.to_string_lossy()))
             .await
             .unwrap();
         let src_file_names: Vec<String> = src_entries
@@ -341,7 +343,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_extract_tgz_bytes_invalid_data() {
-        let extract_dir = "/test-extract-invalid".to_string();
+        let extract_dir = PathBuf::from("/test-extract-invalid");
         tokio_fs_ext::create_dir_all(&extract_dir).await.unwrap();
 
         // Invalid tar.gz data
@@ -352,12 +354,13 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    async fn test_install_single_package_with_url() {
-        let result = install_single_package(
+    async fn test_install_package_with_url() {
+        let result = install_package(
             "lodash",
             "4.17.21",
             &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
             "test-project",
+            "node_modules/lodash",
         )
         .await;
 
@@ -366,54 +369,48 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    async fn test_install_single_package_without_url() {
-        let result = install_single_package("lodash", "4.17.21", &None, "test-project").await;
+    async fn test_install_package_without_url() {
+        let result = install_package("lodash", "4.17.21", &None, "test-project", "node_modules/lodash").await;
 
         assert_eq!(result, "lodash@4.17.21: no resolved field");
     }
 
     #[wasm_bindgen_test]
     async fn test_ensure_package_json_new_project() {
-        let project_name = "/test-project-new".to_string();
+        let project_name = PathBuf::from("/test-project-new");
         tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
 
         let lock = create_test_package_lock();
 
-        let result = ensure_package_json(&project_name, &lock).await;
+        let result = ensure_package_json(&project_name.to_string_lossy(), &lock).await;
         assert!(result.is_ok());
 
         // Verify package.json was created
-        let package_json_exists = tokio_fs_ext::metadata(&format!("{}/package.json", project_name))
-            .await
-            .is_ok();
+        let package_json_exists = tokio_fs_ext::metadata(&format!("{}/package.json", project_name.to_string_lossy())).await.is_ok();
         assert!(package_json_exists);
 
         // Verify node_modules directory was created
-        let node_modules_exists = tokio_fs_ext::metadata(&format!("{}/node_modules", project_name))
-            .await
-            .is_ok();
+        let node_modules_exists = tokio_fs_ext::metadata(&format!("{}/node_modules", project_name.to_string_lossy())).await.is_ok();
         assert!(node_modules_exists);
     }
 
     #[wasm_bindgen_test]
     async fn test_ensure_package_json_existing_project() {
-        let project_name = "/test-project-existing".to_string();
+        let project_name = PathBuf::from("/test-project-existing");
         tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
 
         // Create existing package.json
-        tokio_fs_ext::write(&format!("{}/package.json", project_name), "{}")
+        tokio_fs_ext::write(&format!("{}/package.json", project_name.to_string_lossy()), "{}")
             .await
             .unwrap();
 
         let lock = create_test_package_lock();
 
-        let result = ensure_package_json(&project_name, &lock).await;
+        let result = ensure_package_json(&project_name.to_string_lossy(), &lock).await;
         assert!(result.is_ok());
 
         // Verify existing package.json was not overwritten
-        let content = crate::read(&format!("{}/package.json", project_name))
-            .await
-            .unwrap();
+        let content = crate::read(&format!("{}/package.json", project_name.to_string_lossy())).await.unwrap();
         let content_str = String::from_utf8(content).unwrap();
         assert_eq!(content_str, "{}");
     }
@@ -423,7 +420,7 @@ mod tests {
         let lock = create_test_package_lock();
         let lock_json = serde_json::to_string(&lock).unwrap();
 
-        let project_name = "/test-project-install".to_string();
+        let project_name = PathBuf::from("/test-project-install");
         tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
 
         let results = install_deps(&lock_json).await;
@@ -446,11 +443,11 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_opfs_write() {
-        let test_file = "/test-opfs-write.txt";
+        let test_file = PathBuf::from("/test-opfs-write.txt");
         let content = "Hello, OPFS!";
 
         // Try to write to a file
-        let result = tokio_fs_ext::write(test_file, content).await;
+        let result = tokio_fs_ext::write(&test_file, content).await;
 
         assert!(result.is_ok());
     }
@@ -488,6 +485,190 @@ mod tests {
 
         let results = results.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_nested_node_modules_structure() {
+        // Create a package lock with three-level nested structure
+        let mut packages = std::collections::HashMap::new();
+
+        // Root package
+        let root_package = LockPackage {
+            name: Some("nested-test-project".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: None,
+            integrity: None,
+            license: None,
+            dependencies: Some(std::collections::HashMap::new()),
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        };
+        packages.insert("".to_string(), root_package);
+
+        // Level 1: lodash
+        let lodash_package = LockPackage {
+            name: Some("lodash".to_string()),
+            version: Some("4.17.21".to_string()),
+            resolved: Some("https://registry.npmmirror.com/lodash/-/lodash-4.17.21.tgz".to_string()),
+            integrity: Some("sha512-test-lodash".to_string()),
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        };
+        packages.insert("node_modules/lodash".to_string(), lodash_package);
+
+        // Level 2: lodash.has (dependency of lodash)
+        let lodash_has_package = LockPackage {
+            name: Some("lodash.has".to_string()),
+            version: Some("4.5.2".to_string()),
+            resolved: Some("https://registry.npmmirror.com/lodash.has/-/lodash.has-4.5.2.tgz".to_string()),
+            integrity: Some("sha512-test-lodash-has".to_string()),
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        };
+        packages.insert("node_modules/lodash/node_modules/lodash.has".to_string(), lodash_has_package);
+
+        // Level 3: deep-strict (dependency of lodash.has)
+        let deep_strict_package = LockPackage {
+            name: Some("deep-strict".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmmirror.com/lodash.chunk/-/lodash.chunk-4.2.0.tgz".to_string()),
+            integrity: Some("sha512-test-deep-strict".to_string()),
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        };
+        packages.insert("node_modules/lodash/node_modules/lodash.has/node_modules/deep-strict".to_string(), deep_strict_package);
+
+        let lock = PackageLock {
+            name: "nested-test-project".to_string(),
+            version: "1.0.0".to_string(),
+            lockfile_version: 2,
+            requires: true,
+            packages,
+            dependencies: None,
+        };
+
+        let lock_json = serde_json::to_string(&lock).unwrap();
+        println!("Package lock JSON: {}", lock_json);
+
+        // Test the installation
+        let results = install_deps(&lock_json).await;
+        assert!(results.is_ok());
+
+        let results = results.unwrap();
+
+        // Print actual results for debugging
+        println!("Actual results count: {}", results.len());
+        for result in &results {
+            println!("Result: {}", result);
+        }
+
+        // Check if any packages were installed successfully (network might fail for some)
+        let successful_installations = results.iter().filter(|r| r.contains("installed successfully")).count();
+        let failed_installations = results.iter().filter(|r| r.contains("unexpected end of file") || r.contains("invalid gzip header") || r.contains("NetworkUnreachable")).count();
+
+        // At least one package should be installed successfully, or all should fail due to network issues
+        assert!(
+            successful_installations > 0 || failed_installations == results.len(),
+            "Either some packages should install successfully, or all should fail due to network issues"
+        );
+
+        // Verify the directory structure was created
+        let project_name = "nested-test-project";
+
+        // Check that the main project package.json exists and can be read
+        let root_package_json = tokio_fs_ext::read_to_string(&format!("{}/package.json", project_name)).await;
+        assert!(root_package_json.is_ok(), "Root package.json should exist and be readable");
+
+        // Check that node_modules directory exists and can be read
+        let node_modules_entries = crate::read_dir(&format!("{}/node_modules", project_name)).await;
+        assert!(node_modules_entries.is_ok(), "node_modules directory should exist and be readable");
+
+        // Check that lodash directory exists and can be read
+        let lodash_entries = crate::read_dir(&format!("{}/node_modules/lodash", project_name)).await;
+        assert!(lodash_entries.is_ok(), "lodash directory should exist and be readable");
+
+        // Check that lodash.has directory exists and can be read
+        let lodash_has_entries = crate::read_dir(&format!("{}/node_modules/lodash/node_modules/lodash.has", project_name)).await;
+        assert!(lodash_has_entries.is_ok(), "lodash.has directory should exist and be readable");
+
+        // Check that deep-strict directory exists and can be read
+        let deep_strict_entries = crate::read_dir(&format!("{}/node_modules/lodash/node_modules/lodash.has/node_modules/deep-strict", project_name)).await;
+        assert!(deep_strict_entries.is_ok(), "deep-strict directory should exist and be readable");
+
+        // Test reading directory contents through fuse links
+        // Read /project/node_modules/lodash
+        let lodash_entries = crate::read_dir(&format!("/{}/node_modules/lodash", project_name)).await.unwrap();
+        let lodash_names: Vec<String> = lodash_entries
+            .iter()
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .collect();
+
+
+        // Should contain node_modules (for lodash.has) and package content
+        assert!(lodash_names.contains(&"node_modules".to_string()));
+        assert!(lodash_names.contains(&"package.json".to_string()));
+
+        // Read /project/node_modules/lodash/node_modules/lodash.has
+        let lodash_has_entries = crate::read_dir(&format!("{}/node_modules/lodash/node_modules/lodash.has", project_name)).await.unwrap();
+        let lodash_has_names: Vec<String> = lodash_has_entries
+            .iter()
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .collect();
+        println!("Lodash.has directory entries: {:?}", lodash_has_names);
+
+        // Should contain node_modules (for deep-strict) and package content
+        assert!(lodash_has_names.contains(&"node_modules".to_string()));
+        assert!(lodash_has_names.contains(&"package.json".to_string()));
+
+        // Read /project/node_modules/lodash/node_modules/lodash.has/node_modules/deep-strict
+        let deep_strict_entries = crate::read_dir(&format!("{}/node_modules/lodash/node_modules/lodash.has/node_modules/deep-strict", project_name)).await.unwrap();
+        let deep_strict_names: Vec<String> = deep_strict_entries
+            .iter()
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .collect();
+        println!("Deep-strict directory entries: {:?}", deep_strict_names);
+
+        // Should contain package content (no node_modules at this level)
+        assert!(deep_strict_names.contains(&"package.json".to_string()));
+        assert!(!deep_strict_names.contains(&"node_modules".to_string()));
     }
 
     /// Helper function to create test tar.gz bytes
