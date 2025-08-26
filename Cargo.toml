@@ -1,6 +1,6 @@
 [package]
 name = "opfs-project"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 description = "A Rust library for working with the Origin Private File System (OPFS) in WebAssembly applications"
