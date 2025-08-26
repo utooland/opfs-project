@@ -1,38 +1,6 @@
 use std::io::Result;
 use std::path::Path;
 
-/// Extract package name from a path that contains node_modules
-pub fn get_package_name(path: &str) -> Option<String> {
-    // Find node_modules in the path
-    if let Some(node_modules_pos) = path.find("node_modules") {
-        // Get the part after node_modules
-        let after_node_modules = &path[node_modules_pos + "node_modules".len()..];
-        let after_node_modules = after_node_modules.trim_start_matches('/');
-
-        // Split by '/' and take only the first two components
-        let mut components = after_node_modules.split('/').take(2);
-        let first = components.next()?;
-
-        // Check if first component starts with @ (scoped package)
-        let package_name = if first.starts_with('@') {
-            // For scoped packages, we need two components: @scope/package
-            if let Some(second) = components.next() {
-                format!("{first}/{second}")
-            } else {
-                return None;
-            }
-        } else {
-            // For regular packages, just use the first component
-            first.to_string()
-        };
-
-        if !package_name.is_empty() {
-            return Some(package_name);
-        }
-    }
-    None
-}
-
 /// Prepare path by resolving relative paths against current working directory
 pub fn prepare_path<P: AsRef<Path>>(path: P) -> std::path::PathBuf {
     let path_ref = path.as_ref();
@@ -53,114 +21,20 @@ pub async fn read_dir_direct<P: AsRef<Path>>(path: P) -> Result<Vec<tokio_fs_ext
     read_dir.collect()
 }
 
+/// Read file content as bytes (without fuse.link support)
+pub async fn read_direct<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
+    let prepared_path = crate::util::prepare_path(path);
+    let content = tokio_fs_ext::read(&prepared_path).await?;
+    Ok(content)
+}
+
+
 #[cfg(test)]
 mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
     use super::*;
 
     use wasm_bindgen_test::*;
-
-    #[wasm_bindgen_test]
-    async fn test_get_package_name_regular_package() {
-        let test_cases = vec![
-            (
-                "/path/to/node_modules/lodash/index.js",
-                Some("lodash".to_string()),
-            ),
-            (
-                "/path/to/node_modules/express/lib/app.js",
-                Some("express".to_string()),
-            ),
-            (
-                "/path/to/node_modules/react/package.json",
-                Some("react".to_string()),
-            ),
-            (
-                "node_modules/axios/dist/axios.js",
-                Some("axios".to_string()),
-            ),
-        ];
-
-        for (input, expected) in test_cases {
-            let result = get_package_name(input);
-            assert_eq!(result, expected);
-        }
-    }
-
-    #[wasm_bindgen_test]
-    async fn test_get_package_name_scoped_package() {
-        let test_cases = vec![
-            (
-                "/path/to/node_modules/@types/node/index.d.ts",
-                Some("@types/node".to_string()),
-            ),
-            (
-                "/path/to/node_modules/@angular/core/core.js",
-                Some("@angular/core".to_string()),
-            ),
-            (
-                "/path/to/node_modules/@babel/preset-env/index.js",
-                Some("@babel/preset-env".to_string()),
-            ),
-            (
-                "node_modules/@vue/cli-service/bin/vue-cli-service.js",
-                Some("@vue/cli-service".to_string()),
-            ),
-        ];
-
-        for (input, expected) in test_cases {
-            let result = get_package_name(input);
-            assert_eq!(result, expected);
-        }
-    }
-
-    #[wasm_bindgen_test]
-    async fn test_get_package_name_invalid_paths() {
-        let invalid_paths = vec![
-            "/path/to/some/file.txt",
-            "/path/to/node_modules/",
-            "/path/to/node_modules",
-            "/path/to/some/other/path",
-            "",
-            "node_modules",
-        ];
-
-        for path in invalid_paths {
-            let result = get_package_name(path);
-            assert!(result.is_none(), "Expected None for path: {}", path);
-        }
-    }
-
-    #[wasm_bindgen_test]
-    async fn test_get_package_name_edge_cases() {
-        let test_cases = vec![
-            // Multiple node_modules in path
-            (
-                "/path/to/node_modules/lodash/node_modules/other/index.js",
-                Some("lodash".to_string()),
-            ),
-            // Very long package names
-            (
-                "/path/to/node_modules/very-long-package-name-with-many-characters/index.js",
-                Some("very-long-package-name-with-many-characters".to_string()),
-            ),
-            // Scoped package with long names
-            (
-                "/path/to/node_modules/@very-long-scope/very-long-package-name/index.js",
-                Some("@very-long-scope/very-long-package-name".to_string()),
-            ),
-            // Path with spaces and special characters
-            (
-                "/path/to/node_modules/package-name/index.js",
-                Some("package-name".to_string()),
-            ),
-        ];
-
-        for (input, expected) in test_cases {
-            let result = get_package_name(input);
-            assert_eq!(result, expected);
-        }
-    }
 
     #[wasm_bindgen_test]
     async fn test_prepare_path_absolute() {
