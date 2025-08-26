@@ -1,5 +1,5 @@
-use crate::{DirEntry, DirEntryType};
-use anyhow::Result;
+use std::io::Result;
+use std::path::Path;
 
 /// Extract package name from a path that contains node_modules
 pub fn get_package_name(path: &str) -> Option<String> {
@@ -34,44 +34,23 @@ pub fn get_package_name(path: &str) -> Option<String> {
 }
 
 /// Prepare path by resolving relative paths against current working directory
-pub fn prepare_path(path: &str) -> String {
-    if path.starts_with('/') {
-        path.to_string()
+pub fn prepare_path<P: AsRef<Path>>(path: P) -> std::path::PathBuf {
+    let path_ref = path.as_ref();
+    let path_str = path_ref.to_string_lossy();
+
+    if path_str.starts_with('/') {
+        std::path::PathBuf::from(path_str.as_ref())
     } else {
-        let cwd = crate::cwd::get_cwd();
-        let cwd = cwd.to_string_lossy();
-        format!("{cwd}/{path}")
+        let cwd = crate::get_cwd();
+        cwd.join(path_ref)
     }
 }
 
 /// Read directory directly without fuse.link logic
-pub async fn read_dir_direct(path: &str) -> Result<Vec<DirEntry>> {
-    let mut entries = Vec::new();
-    let mut read_dir = tokio_fs_ext::read_dir(path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Error reading directory: {}", e))?;
-
-    while let Some(entry) = read_dir.next_entry().await? {
-        let entry_path = entry.path();
-
-        if let Some(name) = entry_path.file_name()
-            && let Some(name_str) = name.to_str()
-        {
-            let meta = tokio_fs_ext::metadata(&entry_path).await?;
-
-            let dir_entry = DirEntry {
-                name: name_str.to_string(),
-                r#type: if meta.is_dir() {
-                    DirEntryType::Directory
-                } else {
-                    DirEntryType::File
-                },
-            };
-            entries.push(dir_entry);
-        }
-    }
-
-    Ok(entries)
+pub async fn read_dir_direct<P: AsRef<Path>>(path: P) -> Result<Vec<tokio_fs_ext::DirEntry>> {
+    let path_ref = path.as_ref();
+    let read_dir = tokio_fs_ext::read_dir(path_ref).await?;
+    read_dir.collect()
 }
 
 #[cfg(test)]
@@ -194,7 +173,7 @@ mod tests {
 
         for path in test_cases {
             let result = prepare_path(path);
-            assert_eq!(result, path);
+            assert_eq!(result.to_string_lossy(), path);
         }
     }
 
@@ -213,18 +192,19 @@ mod tests {
 
         for relative_path in test_cases {
             let result = prepare_path(relative_path);
+            let result_str = result.to_string_lossy();
 
             // Verify that the result contains the relative path at the end
             assert!(
-                result.ends_with(relative_path),
+                result_str.ends_with(relative_path),
                 "Result '{}' should end with '{}'",
-                result,
+                result_str,
                 relative_path
             );
 
             // Verify that it's not an absolute path starting with /
             assert!(
-                !relative_path.starts_with('/') || result != relative_path,
+                !relative_path.starts_with('/') || result_str != relative_path,
                 "Relative path '{}' should be resolved to absolute path",
                 relative_path
             );
@@ -234,17 +214,18 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_prepare_path_empty() {
         let result = prepare_path("");
+        let result_str = result.to_string_lossy();
 
         // Should end with a slash since it's an empty path
         assert!(
-            result.ends_with('/'),
+            result_str.ends_with('/'),
             "Empty path should end with '/', got: {}",
-            result
+            result_str
         );
 
         // Should not be empty
         assert!(
-            !result.is_empty(),
+            !result_str.is_empty(),
             "Empty path should not result in empty string"
         );
     }
@@ -252,7 +233,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_read_dir_direct() {
         let temp_path = "/test-read-dir-direct".to_string();
-        crate::opfs::create_dir_all(&temp_path).await.unwrap();
+        tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
 
         // Create test files and directories
         tokio_fs_ext::write(&format!("{}/file1.txt", temp_path), b"content1")
@@ -273,7 +254,10 @@ mod tests {
         // Should have at least 3 entries (file1.txt, file2.js, subdir)
         assert!(entries.len() >= 3);
 
-        let file_names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        let file_names: Vec<String> = entries
+            .iter()
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .collect();
 
         // Check for files
         assert!(file_names.contains(&"file1.txt".to_string()));
@@ -284,16 +268,18 @@ mod tests {
 
         // Verify file types
         for entry in &entries {
-            match entry.name.as_str() {
-                "file1.txt" | "file2.js" => {
-                    assert_eq!(entry.r#type, crate::DirEntryType::File);
-                    assert_ne!(entry.r#type, crate::DirEntryType::Directory);
+            if let Some(name) = entry.file_name().to_str() {
+                match name {
+                    "file1.txt" | "file2.js" => {
+                        let meta = tokio_fs_ext::metadata(entry.path()).await.unwrap();
+                        assert!(!meta.is_dir());
+                    }
+                    "subdir" => {
+                        let meta = tokio_fs_ext::metadata(entry.path()).await.unwrap();
+                        assert!(meta.is_dir());
+                    }
+                    _ => {}
                 }
-                "subdir" => {
-                    assert_ne!(entry.r#type, crate::DirEntryType::File);
-                    assert_eq!(entry.r#type, crate::DirEntryType::Directory);
-                }
-                _ => {}
             }
         }
     }
@@ -301,7 +287,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_read_dir_direct_empty_directory() {
         let temp_path = "/test-read-dir-empty".to_string();
-        crate::opfs::create_dir_all(&temp_path).await.unwrap();
+        tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
 
         let entries = read_dir_direct(&temp_path).await.unwrap();
 
@@ -318,7 +304,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_read_dir_direct_with_hidden_files() {
         let temp_path = "/test-read-dir-hidden".to_string();
-        crate::opfs::create_dir_all(&temp_path).await.unwrap();
+        tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
 
         // Create regular and hidden files
         tokio_fs_ext::write(&format!("{}/visible.txt", temp_path), b"visible")
@@ -333,7 +319,10 @@ mod tests {
 
         let entries = read_dir_direct(&temp_path).await.unwrap();
 
-        let file_names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        let file_names: Vec<String> = entries
+            .iter()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
 
         // Should include both visible and hidden files
         assert!(file_names.contains(&"visible.txt".to_string()));
@@ -344,7 +333,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_read_dir_direct_with_special_characters() {
         let temp_path = "/test-read-dir-special".to_string();
-        crate::opfs::create_dir_all(&temp_path).await.unwrap();
+        tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
 
         // Create files with special characters in names
         tokio_fs_ext::write(&format!("{}/file with spaces.txt", temp_path), b"content")
@@ -362,7 +351,10 @@ mod tests {
 
         let entries = read_dir_direct(&temp_path).await.unwrap();
 
-        let file_names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        let file_names: Vec<String> = entries
+            .iter()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
 
         assert!(file_names.contains(&"file with spaces.txt".to_string()));
         assert!(file_names.contains(&"file-with-dashes.js".to_string()));

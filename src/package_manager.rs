@@ -1,11 +1,11 @@
-use anyhow::Result;
 use flate2::read::GzDecoder;
 use futures::future::join_all;
 use std::io::Read;
+use std::io::Result;
 use tar::Archive;
 
 use super::fuse;
-use super::opfs;
+
 use crate::package_lock::PackageLock;
 
 /// Download all tgz packages to OPFS
@@ -38,14 +38,17 @@ pub async fn install_deps(package_lock: &str) -> Result<Vec<String>> {
 
 /// Write root package.json to the project directory
 async fn ensure_package_json(project_name: &str, lock: &PackageLock) -> Result<()> {
-    if opfs::exists(&format!("{project_name}/package.json")).await? {
+    if tokio_fs_ext::metadata(&format!("{project_name}/package.json"))
+        .await
+        .is_ok()
+    {
         return Ok(());
     }
 
     if let Some(root_pkg) = lock.packages.get("") {
         let pkg_json = serde_json::to_string_pretty(root_pkg).unwrap_or("{}".to_string());
-        opfs::create_dir_all(&format!("{project_name}/node_modules")).await?;
-        opfs::write(&format!("{project_name}/package.json"), &pkg_json).await?;
+        tokio_fs_ext::create_dir_all(&format!("{project_name}/node_modules")).await?;
+        tokio_fs_ext::write(&format!("{project_name}/package.json"), pkg_json.as_bytes()).await?;
     }
     Ok(())
 }
@@ -76,7 +79,7 @@ async fn install_package(
     let paths = PackagePaths::new(name, tgz_url, project_name);
 
     // Check if already unpacked
-    if opfs::exists(&paths.unpacked_dir).await.unwrap_or(false) {
+    if tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_ok() {
         fuse::fuse_link(&paths.unpacked_dir, &paths.unpack_dir).await?;
         return Ok(());
     }
@@ -93,19 +96,11 @@ async fn install_package(
 
 /// Get or download tgz file
 async fn get_or_download_tgz(tgz_url: &str, tgz_store_path: &str) -> Result<Vec<u8>> {
-    if opfs::exists(tgz_store_path).await.unwrap_or(false) {
-        opfs::read_without_fuse_link(tgz_store_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("read cache error: {e:?}"))
+    if tokio_fs_ext::metadata(tgz_store_path).await.is_ok() {
+        super::fuse::read_without_fuse_link(tgz_store_path).await
     } else {
-        let bytes = download_bytes(tgz_url)
-            .await
-            .map_err(|e| anyhow::anyhow!("download error: {e:?}"))?;
-
-        save_tgz(tgz_store_path, &bytes)
-            .await
-            .map_err(|e| anyhow::anyhow!("write tgz error: {e:?}"))?;
-
+        let bytes = download_bytes(tgz_url).await?;
+        save_tgz(tgz_store_path, &bytes).await?;
         Ok(bytes)
     }
 }
@@ -134,11 +129,16 @@ impl PackagePaths {
 pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &str) -> Result<()> {
     let gz = GzDecoder::new(tgz_bytes);
     let mut archive = Archive::new(gz);
-    let entries = archive.entries()?;
+    let entries = archive
+        .entries()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     for entry in entries {
-        let mut entry = entry?;
-        let path = entry.path()?;
+        let mut entry =
+            entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let path = entry
+            .path()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let path_str = path.to_string_lossy().to_string();
 
         // Remove the first-level "package" directory if present
@@ -153,7 +153,9 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &str) -> Result<()
 
         if entry.header().entry_type().is_file() {
             let mut contents = Vec::new();
-            entry.read_to_end(&mut contents)?;
+            entry
+                .read_to_end(&mut contents)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             // Write the file to the output path
             save_tgz(&out_path, &contents).await?;
         }
@@ -167,15 +169,20 @@ async fn save_tgz(path: &str, bytes: &[u8]) -> Result<()> {
     if let Some(parent_dir) = std::path::Path::new(path).parent()
         && let Some(parent_str) = parent_dir.to_str()
     {
-        opfs::create_dir_all(parent_str).await?;
+        tokio_fs_ext::create_dir_all(parent_str).await?;
     }
-    opfs::write_bytes(path, bytes).await
+    tokio_fs_ext::write(path, bytes).await
 }
 
 /// Download bytes from URL
 async fn download_bytes(url: &str) -> Result<Vec<u8>> {
-    let response = reqwest::get(url).await?;
-    let bytes = response.bytes().await?;
+    let response = reqwest::get(url)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NetworkUnreachable, e))?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NetworkUnreachable, e))?;
     Ok(bytes.to_vec())
 }
 #[cfg(test)]
@@ -183,7 +190,6 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
     use super::*;
     use crate::package_lock::{LockPackage, PackageLock};
-
 
     use wasm_bindgen_test::*;
 
@@ -281,7 +287,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_extract_tgz_bytes_simple() {
         let extract_dir = "/test-extract-simple".to_string();
-        crate::opfs::create_dir_all(&extract_dir).await.unwrap();
+        tokio_fs_ext::create_dir_all(&extract_dir).await.unwrap();
 
         // Create a simple tar.gz with test content
         let tgz_bytes = create_test_tgz_bytes();
@@ -290,8 +296,11 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify files were extracted
-        let entries = crate::opfs::read_dir(&extract_dir).await.unwrap();
-        let file_names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        let entries = crate::read_dir(&extract_dir).await.unwrap();
+        let file_names: Vec<String> = entries
+            .iter()
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .collect();
 
         assert!(file_names.contains(&"package.json".to_string()));
         assert!(file_names.contains(&"index.js".to_string()));
@@ -300,7 +309,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_extract_tgz_bytes_with_package_prefix() {
         let extract_dir = "/test-extract-prefix".to_string();
-        crate::opfs::create_dir_all(&extract_dir).await.unwrap();
+        tokio_fs_ext::create_dir_all(&extract_dir).await.unwrap();
 
         // Create a tar.gz with package/ prefix
         let tgz_bytes = create_test_tgz_with_package_prefix();
@@ -309,23 +318,31 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify files were extracted without package/ prefix
-        let entries = crate::opfs::read_dir(&extract_dir).await.unwrap();
-        let file_names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        let entries = crate::read_dir(&extract_dir).await.unwrap();
+        let file_names: Vec<String> = entries
+            .iter()
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .collect();
 
         assert!(file_names.contains(&"package.json".to_string()));
         assert!(file_names.contains(&"src".to_string()));
         assert!(!file_names.contains(&"package".to_string()));
 
         // Check that src is a directory and contains main.js
-        let src_entries = crate::opfs::read_dir(&format!("{}/src", extract_dir)).await.unwrap();
-        let src_file_names: Vec<String> = src_entries.iter().map(|e| e.name.clone()).collect();
+        let src_entries = crate::read_dir(&format!("{}/src", extract_dir))
+            .await
+            .unwrap();
+        let src_file_names: Vec<String> = src_entries
+            .iter()
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .collect();
         assert!(src_file_names.contains(&"main.js".to_string()));
     }
 
     #[wasm_bindgen_test]
     async fn test_extract_tgz_bytes_invalid_data() {
         let extract_dir = "/test-extract-invalid".to_string();
-        crate::opfs::create_dir_all(&extract_dir).await.unwrap();
+        tokio_fs_ext::create_dir_all(&extract_dir).await.unwrap();
 
         // Invalid tar.gz data
         let invalid_bytes = b"not a valid tar.gz file";
@@ -358,7 +375,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_ensure_package_json_new_project() {
         let project_name = "/test-project-new".to_string();
-        crate::opfs::create_dir_all(&project_name).await.unwrap();
+        tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
 
         let lock = create_test_package_lock();
 
@@ -366,25 +383,25 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify package.json was created
-        let package_json_exists = crate::opfs::exists(&format!("{}/package.json", project_name))
+        let package_json_exists = tokio_fs_ext::metadata(&format!("{}/package.json", project_name))
             .await
-            .unwrap();
+            .is_ok();
         assert!(package_json_exists);
 
         // Verify node_modules directory was created
-        let node_modules_exists = crate::opfs::exists(&format!("{}/node_modules", project_name))
+        let node_modules_exists = tokio_fs_ext::metadata(&format!("{}/node_modules", project_name))
             .await
-            .unwrap();
+            .is_ok();
         assert!(node_modules_exists);
     }
 
     #[wasm_bindgen_test]
     async fn test_ensure_package_json_existing_project() {
         let project_name = "/test-project-existing".to_string();
-        crate::opfs::create_dir_all(&project_name).await.unwrap();
+        tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
 
         // Create existing package.json
-        crate::opfs::write(&format!("{}/package.json", project_name), "{}")
+        tokio_fs_ext::write(&format!("{}/package.json", project_name), "{}")
             .await
             .unwrap();
 
@@ -394,7 +411,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify existing package.json was not overwritten
-        let content = crate::opfs::read_with_fuse_link(&format!("{}/package.json", project_name))
+        let content = crate::read(&format!("{}/package.json", project_name))
             .await
             .unwrap();
         let content_str = String::from_utf8(content).unwrap();
@@ -407,12 +424,9 @@ mod tests {
         let lock_json = serde_json::to_string(&lock).unwrap();
 
         let project_name = "/test-project-install".to_string();
-        crate::opfs::create_dir_all(&project_name).await.unwrap();
+        tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
 
         let results = install_deps(&lock_json).await;
-        if let Err(ref e) = results {
-            web_sys::console::log_1(&format!("Error in install_deps: {:?}", e).into());
-        }
         assert!(results.is_ok());
 
         let results = results.unwrap();
@@ -436,11 +450,7 @@ mod tests {
         let content = "Hello, OPFS!";
 
         // Try to write to a file
-        let result = crate::opfs::write(test_file, content).await;
-
-        if let Err(ref e) = result {
-            web_sys::console::log_1(&format!("Error in opfs::write: {:?}", e).into());
-        }
+        let result = tokio_fs_ext::write(test_file, content).await;
 
         assert!(result.is_ok());
     }

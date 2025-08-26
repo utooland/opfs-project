@@ -7,14 +7,13 @@ description = "A Rust library for working with the Origin Private File System (O
 repository = "https://github.com/utooland/opfs-project"
 homepage = "https://github.com/utooland/opfs-project"
 documentation = "https://docs.rs/opfs-project"
-keywords = ["wasm","opfs", "file-system", "browser", "storage"]
+keywords = ["wasm", "opfs", "file-system", "browser", "storage"]
 categories = ["wasm", "filesystem", "web-programming"]
 authors = ["elrrrrrrr <elrrrrrrr@gmail.com>"]
 readme = "README.md"
 exclude = [".gitignore", ".github/", "target/", "pkg/"]
 
 [dependencies]
-anyhow = "1.0.96"
 serde = { version = "1.0.219", features = ["derive"] }
 flate2 = "1.1.2"
 tar = "0.4.44"
@@ -22,9 +21,7 @@ futures = "0.3.31"
 futures-util = "0.3.31"
 reqwest = { version = "0.12.22" }
 serde_json = "1.0.140"
-tokio-fs-ext = "0.3.9"
-web-sys = { version = "0.3", features = ["console"] }
-wasm-bindgen = "0.2"
+tokio-fs-ext = "0.5.3"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
