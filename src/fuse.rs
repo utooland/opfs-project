@@ -474,7 +474,7 @@ mod tests {
 
         // Test reading through the main read function
         let node_modules_file = Path::new(&package_path).join("fuse_test.txt");
-        let result = read(&node_modules_file).await.unwrap();
+        let result = crate::read(&node_modules_file).await.unwrap();
 
         assert_eq!(result, b"Fuse link test content");
     }
@@ -486,7 +486,7 @@ mod tests {
         let package_path = create_node_modules_structure(&base_path, package_name).await;
 
         // Test reading directory through the main read_dir function
-        let result = read_dir(&package_path).await.unwrap();
+        let result = crate::read_dir(&package_path).await.unwrap();
 
         assert!(!result.is_empty());
         let file_names: Vec<String> = result
@@ -502,7 +502,9 @@ mod tests {
         let base_path = create_test_dir("test-read-regular-file").await;
 
         // Test reading a regular file (not in node_modules)
-        let result = read(&Path::new(&base_path).join("test.txt")).await.unwrap();
+        let result = tokio_fs_ext::read(&Path::new(&base_path).join("test.txt"))
+            .await
+            .unwrap();
         assert_eq!(result, b"Hello, World!");
     }
 
@@ -511,7 +513,8 @@ mod tests {
         let base_path = create_test_dir("test-read-dir-regular-directory").await;
 
         // Test reading a regular directory
-        let result = read_dir(&base_path).await.unwrap();
+
+        let result = crate::read_dir(&base_path).await.unwrap();
 
         assert!(!result.is_empty());
         let file_names: Vec<String> = result
