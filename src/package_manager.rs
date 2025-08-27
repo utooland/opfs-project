@@ -15,7 +15,7 @@ pub async fn install_deps(package_lock: &str) -> Result<Vec<String>> {
     let project_name = lock.name.clone();
 
     // Write package.json to root
-    ensure_package_json(&project_name, &lock).await?;
+    ensure_package_json(&lock).await?;
 
     // Prepare tasks for parallel execution
     let tasks: Vec<_> = lock
@@ -39,8 +39,8 @@ pub async fn install_deps(package_lock: &str) -> Result<Vec<String>> {
 }
 
 /// Write root package.json to the project directory
-async fn ensure_package_json(project_name: &str, lock: &PackageLock) -> Result<()> {
-    if tokio_fs_ext::metadata(&format!("{project_name}/package.json"))
+async fn ensure_package_json(lock: &PackageLock) -> Result<()> {
+    if tokio_fs_ext::metadata(&format!("./package.json"))
         .await
         .is_ok()
     {
@@ -49,8 +49,8 @@ async fn ensure_package_json(project_name: &str, lock: &PackageLock) -> Result<(
 
     if let Some(root_pkg) = lock.packages.get("") {
         let pkg_json = serde_json::to_string_pretty(root_pkg).unwrap_or("{}".to_string());
-        tokio_fs_ext::create_dir_all(&format!("{project_name}/node_modules")).await?;
-        tokio_fs_ext::write(&format!("{project_name}/package.json"), pkg_json.as_bytes()).await?;
+        tokio_fs_ext::create_dir_all(&format!("./node_modules")).await?;
+        tokio_fs_ext::write(&format!("./package.json"), pkg_json.as_bytes()).await?;
     }
     Ok(())
 }
