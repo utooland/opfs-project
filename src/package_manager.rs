@@ -1,5 +1,4 @@
 use flate2::read::GzDecoder;
-use futures::future::join_all;
 use std::io::Read;
 use std::io::Result;
 use std::path::PathBuf;
@@ -17,25 +16,58 @@ pub async fn install_deps(package_lock: &str) -> Result<Vec<String>> {
     // Write package.json to root
     ensure_package_json(&lock).await?;
 
-    // Prepare tasks for parallel execution
-    let tasks: Vec<_> = lock
+    // Filter out empty path packages
+    let packages: Vec<_> = lock
         .packages
         .iter()
         .filter(|(path, _)| !path.is_empty())
-        .map(|(path, pkg)| {
-            let name = pkg.get_name(path);
-            let version = pkg.get_version();
-            let tgz_url = pkg.resolved.clone();
-            let project_name = project_name.clone();
-            let path_key = path.clone();
-
-            async move { install_package(&name, &version, &tgz_url, &project_name, &path_key).await }
-        })
         .collect();
 
-    // Run all tasks in parallel and collect results
-    let results = join_all(tasks).await;
+    // Use spawn_local for better performance
+    let results = install_packages_with_spawn(packages, &project_name).await;
     Ok(results)
+}
+
+/// Install packages using spawn_local for better performance
+async fn install_packages_with_spawn(
+    packages: Vec<(&String, &crate::package_lock::LockPackage)>,
+    project_name: &str,
+) -> Vec<String> {
+    use futures::channel::oneshot;
+    use wasm_bindgen_futures::spawn_local;
+
+    let mut handles = Vec::new();
+
+    for (path, pkg) in packages {
+        let name = pkg.get_name(path);
+        let version = pkg.get_version();
+        let tgz_url = pkg.resolved.clone();
+        let project_name = project_name.to_string();
+        let path_key = path.clone();
+
+        // Create a channel for getting the result
+        let (tx, rx) = oneshot::channel();
+
+        // Spawn the task using spawn_local
+        spawn_local(async move {
+            let result = install_package(&name, &version, &tgz_url, &project_name, &path_key).await;
+
+            // Send result back through the channel
+            let _ = tx.send(result);
+        });
+
+        handles.push(rx);
+    }
+
+    // Collect all results
+    let mut final_results = Vec::new();
+    for handle in handles {
+        if let Ok(result) = handle.await {
+            final_results.push(result);
+        }
+    }
+
+    final_results
 }
 
 /// Write root package.json to the project directory
