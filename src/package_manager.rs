@@ -189,7 +189,7 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
 mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
     use super::*;
-    use crate::package_lock::{LockPackage, PackageLock};
+    use crate::{package_lock::{LockPackage, PackageLock}, set_cwd};
 
     use wasm_bindgen_test::*;
 
@@ -378,19 +378,20 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_ensure_package_json_new_project() {
         let project_name = PathBuf::from("/test-project-new");
+        set_cwd("/test-project-new");
         tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
 
         let lock = create_test_package_lock();
 
-        let result = ensure_package_json(&project_name.to_string_lossy(), &lock).await;
+        let result = ensure_package_json(&lock).await;
         assert!(result.is_ok());
 
         // Verify package.json was created
-        let package_json_exists = tokio_fs_ext::metadata(&format!("{}/package.json", project_name.to_string_lossy())).await.is_ok();
+        let package_json_exists = tokio_fs_ext::metadata(&format!("/{}/package.json", project_name.to_string_lossy())).await.is_ok();
         assert!(package_json_exists);
 
         // Verify node_modules directory was created
-        let node_modules_exists = tokio_fs_ext::metadata(&format!("{}/node_modules", project_name.to_string_lossy())).await.is_ok();
+        let node_modules_exists = tokio_fs_ext::metadata(&format!("/{}/node_modules", project_name.to_string_lossy())).await.is_ok();
         assert!(node_modules_exists);
     }
 
@@ -406,7 +407,7 @@ mod tests {
 
         let lock = create_test_package_lock();
 
-        let result = ensure_package_json(&project_name.to_string_lossy(), &lock).await;
+        let result = ensure_package_json(&lock).await;
         assert!(result.is_ok());
 
         // Verify existing package.json was not overwritten
@@ -489,6 +490,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_nested_node_modules_structure() {
+        set_cwd("/nested-test-project");
         // Create a package lock with three-level nested structure
         let mut packages = std::collections::HashMap::new();
 
@@ -611,43 +613,42 @@ mod tests {
         );
 
         // Verify the directory structure was created
-        let project_name = "nested-test-project";
+        // Since ensure_package_json now uses relative paths, we check relative to current directory
 
         // Check that the main project package.json exists and can be read
-        let root_package_json = tokio_fs_ext::read_to_string(&format!("{}/package.json", project_name)).await;
+        let root_package_json = tokio_fs_ext::read_to_string("./package.json").await;
         assert!(root_package_json.is_ok(), "Root package.json should exist and be readable");
 
         // Check that node_modules directory exists and can be read
-        let node_modules_entries = crate::read_dir(&format!("{}/node_modules", project_name)).await;
+        let node_modules_entries = crate::read_dir("./node_modules").await;
         assert!(node_modules_entries.is_ok(), "node_modules directory should exist and be readable");
 
         // Check that lodash directory exists and can be read
-        let lodash_entries = crate::read_dir(&format!("{}/node_modules/lodash", project_name)).await;
+        let lodash_entries = crate::read_dir("./node_modules/lodash").await;
         assert!(lodash_entries.is_ok(), "lodash directory should exist and be readable");
 
         // Check that lodash.has directory exists and can be read
-        let lodash_has_entries = crate::read_dir(&format!("{}/node_modules/lodash/node_modules/lodash.has", project_name)).await;
+        let lodash_has_entries = crate::read_dir("./node_modules/lodash/node_modules/lodash.has").await;
         assert!(lodash_has_entries.is_ok(), "lodash.has directory should exist and be readable");
 
         // Check that deep-strict directory exists and can be read
-        let deep_strict_entries = crate::read_dir(&format!("{}/node_modules/lodash/node_modules/lodash.has/node_modules/deep-strict", project_name)).await;
+        let deep_strict_entries = crate::read_dir("./node_modules/lodash/node_modules/lodash.has/node_modules/deep-strict").await;
         assert!(deep_strict_entries.is_ok(), "deep-strict directory should exist and be readable");
 
         // Test reading directory contents through fuse links
-        // Read /project/node_modules/lodash
-        let lodash_entries = crate::read_dir(&format!("/{}/node_modules/lodash", project_name)).await.unwrap();
+        // Read ./node_modules/lodash
+        let lodash_entries = crate::read_dir("./node_modules/lodash").await.unwrap();
         let lodash_names: Vec<String> = lodash_entries
             .iter()
             .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
             .collect();
 
-
         // Should contain node_modules (for lodash.has) and package content
         assert!(lodash_names.contains(&"node_modules".to_string()));
         assert!(lodash_names.contains(&"package.json".to_string()));
 
-        // Read /project/node_modules/lodash/node_modules/lodash.has
-        let lodash_has_entries = crate::read_dir(&format!("{}/node_modules/lodash/node_modules/lodash.has", project_name)).await.unwrap();
+        // Read ./node_modules/lodash/node_modules/lodash.has
+        let lodash_has_entries = crate::read_dir("./node_modules/lodash/node_modules/lodash.has").await.unwrap();
         let lodash_has_names: Vec<String> = lodash_has_entries
             .iter()
             .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
@@ -658,8 +659,8 @@ mod tests {
         assert!(lodash_has_names.contains(&"node_modules".to_string()));
         assert!(lodash_has_names.contains(&"package.json".to_string()));
 
-        // Read /project/node_modules/lodash/node_modules/lodash.has/node_modules/deep-strict
-        let deep_strict_entries = crate::read_dir(&format!("{}/node_modules/lodash/node_modules/lodash.has/node_modules/deep-strict", project_name)).await.unwrap();
+        // Read ./node_modules/lodash/node_modules/lodash.has/node_modules/deep-strict
+        let deep_strict_entries = crate::read_dir("./node_modules/lodash/node_modules/lodash.has/node_modules/deep-strict").await.unwrap();
         let deep_strict_names: Vec<String> = deep_strict_entries
             .iter()
             .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
