@@ -1205,9 +1205,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-fs-ext"
-version = "0.5.4"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3768e656a4795a2eaaca9137c35022a351b59e1021763636bfc992549fab94b4"
+checksum = "87223f929731a8c553fc96b4fe4799eaca35e22b7e6a7aab420093cfaa96b930"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -1217,7 +1217,6 @@ dependencies = [
  "rustc-hash",
  "tokio",
  "tokio-stream",
- "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -1319,19 +1318,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "784e0ac535deb450455cbfa28a6f0df145ea1bb7ae51b821cf5e7927fdcfbdd0"
 dependencies = [
  "pin-project-lite",
- "tracing-attributes",
  "tracing-core",
-]
-
-[[package]]
-name = "tracing-attributes"
-version = "0.1.30"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81383ab64e72a7a8b8e13130c49e3dab29def6d0c7d76a03087b3cf71c5c6903"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
