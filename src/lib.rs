@@ -92,3 +92,15 @@ pub fn set_cwd(path: impl AsRef<Path>) {
 pub fn get_cwd() -> PathBuf {
     tokio_fs_ext::current_dir().unwrap()
 }
+
+/// Clear the internal fuse.link cache to free memory
+/// This is useful for long-running applications or testing
+pub fn clear_fuse_cache() {
+    fuse::clear_fuse_link_cache();
+}
+
+/// Get fuse cache statistics for monitoring
+/// Returns (cache_size, list_of_cached_paths)
+pub fn get_fuse_cache_stats() -> (usize, Vec<String>) {
+    fuse::get_cache_stats()
+}

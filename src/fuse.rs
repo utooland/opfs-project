@@ -1,9 +1,15 @@
 
 use std::io::{Error, ErrorKind, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::sync::{Mutex, LazyLock};
 
 use crate::util::read_dir_direct;
 use tracing::{info, instrument};
+
+// Global cache for fuse.link mappings to avoid repeated file reads
+// Key: fuse.link file path, Value: target directory path
+static FUSE_LINK_CACHE: LazyLock<Mutex<HashMap<PathBuf, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // Create fuse link between source and destination directories
 // node_modules/@a/b/fuse.link -> /stores/@a/b/unpack
@@ -27,8 +33,34 @@ pub async fn fuse_link<S: AsRef<Path>, D: AsRef<Path>>(src: S, dst: D) -> Result
     info!("Writing fuse.link file at {}", fuse_link_path.display());
     tokio_fs_ext::write(&fuse_link_path, link_content.as_bytes()).await?;
 
+    // Cache the mapping for future reads
+    if let Ok(mut cache) = FUSE_LINK_CACHE.lock() {
+        cache.insert(fuse_link_path.clone(), src_ref.to_string_lossy().to_string());
+        info!("Cached fuse link mapping: {} -> {}", fuse_link_path.display(), src_ref.display());
+    }
+
     info!("Successfully created fuse link");
     Ok(())
+}
+
+/// Clear the fuse.link cache (useful for testing or memory management)
+pub fn clear_fuse_link_cache() {
+    if let Ok(mut cache) = FUSE_LINK_CACHE.lock() {
+        let count = cache.len();
+        cache.clear();
+        info!("Cleared {} cached fuse.link mappings", count);
+    }
+}
+
+/// Get cache statistics (for debugging/monitoring)
+pub fn get_cache_stats() -> (usize, Vec<String>) {
+    if let Ok(cache) = FUSE_LINK_CACHE.lock() {
+        let count = cache.len();
+        let paths: Vec<String> = cache.keys().map(|p| p.to_string_lossy().to_string()).collect();
+        (count, paths)
+    } else {
+        (0, vec![])
+    }
 }
 
 // Get fuse.link path for a given path that contains node_modules
@@ -107,33 +139,69 @@ async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_pa
         },
     };
 
-    // Step 2: Read fuse.link file
-    let read_link_start = start_time.elapsed();
-    let link_content = match tokio_fs_ext::read_to_string(&fuse_link_path).await {
-        Ok(content) => {
-            let read_link_duration = start_time.elapsed() - read_link_start;
-            info!("Successfully read fuse.link content ({:.2}ms)", read_link_duration.as_secs_f64() * 1000.0);
-            content
-        },
-        Err(e) => {
-            let read_link_duration = start_time.elapsed() - read_link_start;
-            info!("Failed to read fuse.link file: {:?} ({:.2}ms)", e, read_link_duration.as_secs_f64() * 1000.0);
+    // Step 2: Check cache first, then read fuse.link file
+    let cache_lookup_start = start_time.elapsed();
+    let target_dir = if let Ok(cache) = FUSE_LINK_CACHE.lock() {
+        if let Some(cached_target) = cache.get(&fuse_link_path) {
+            let cache_hit_duration = start_time.elapsed() - cache_lookup_start;
+            info!("Cache hit for fuse.link: {} ({:.2}ms)", cached_target, cache_hit_duration.as_secs_f64() * 1000.0);
+            cached_target.clone()
+        } else {
+            drop(cache); // Release lock before async operation
+            
+            let read_link_start = start_time.elapsed();
+            let link_content = match tokio_fs_ext::read_to_string(&fuse_link_path).await {
+                Ok(content) => {
+                    let read_link_duration = start_time.elapsed() - read_link_start;
+                    info!("Cache miss - read fuse.link content ({:.2}ms)", read_link_duration.as_secs_f64() * 1000.0);
+                    content
+                },
+                Err(e) => {
+                    let read_link_duration = start_time.elapsed() - read_link_start;
+                    info!("Failed to read fuse.link file: {:?} ({:.2}ms)", e, read_link_duration.as_secs_f64() * 1000.0);
+                    return Ok(None);
+                },
+            };
+            
+            let target_dir = link_content.lines().next().unwrap_or("").trim().to_string();
+            if target_dir.is_empty() {
+                info!("Empty target directory in fuse.link");
+                return Ok(None);
+            }
+            
+            // Update cache
+            if let Ok(mut cache) = FUSE_LINK_CACHE.lock() {
+                cache.insert(fuse_link_path.clone(), target_dir.clone());
+                info!("Cached new fuse link mapping after read");
+            }
+            
+            target_dir
+        }
+    } else {
+        // Fallback to direct file read if cache lock fails
+        let read_link_start = start_time.elapsed();
+        let link_content = match tokio_fs_ext::read_to_string(&fuse_link_path).await {
+            Ok(content) => {
+                let read_link_duration = start_time.elapsed() - read_link_start;
+                info!("Cache unavailable - read fuse.link content ({:.2}ms)", read_link_duration.as_secs_f64() * 1000.0);
+                content
+            },
+            Err(e) => {
+                let read_link_duration = start_time.elapsed() - read_link_start;
+                info!("Failed to read fuse.link file: {:?} ({:.2}ms)", e, read_link_duration.as_secs_f64() * 1000.0);
+                return Ok(None);
+            },
+        };
+        
+        let target_dir = link_content.lines().next().unwrap_or("").trim();
+        if target_dir.is_empty() {
+            info!("Empty target directory in fuse.link");
             return Ok(None);
-        },
+        }
+        target_dir.to_string()
     };
-
-    // Step 3: Parse target directory
-    let parse_start = start_time.elapsed();
-    let target_dir = link_content.lines().next().unwrap_or("").trim();
-    if target_dir.is_empty() {
-        let parse_duration = start_time.elapsed() - parse_start;
-        info!("Empty target directory in fuse.link ({:.2}ms)", parse_duration.as_secs_f64() * 1000.0);
-        return Ok(None);
-    }
-    let parse_duration = start_time.elapsed() - parse_start;
-    info!("Target directory from fuse.link: {} ({:.2}ms)", target_dir, parse_duration.as_secs_f64() * 1000.0);
-
-    // Step 4: Calculate relative path from fuse_link_path to prepared_path
+    
+    // Step 3: Calculate relative path from fuse_link_path to prepared_path
     let calc_path_start = start_time.elapsed();
     let fuse_link_dir = fuse_link_path.parent().ok_or_else(|| {
         Error::new(ErrorKind::InvalidInput, "Invalid fuse.link path")
@@ -143,7 +211,7 @@ async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_pa
         Error::new(ErrorKind::InvalidInput, "Path is not under fuse.link directory")
     })?;
 
-    let target_path = Path::new(target_dir).join(relative_path);
+    let target_path = Path::new(&target_dir).join(relative_path);
     let calc_path_duration = start_time.elapsed() - calc_path_start;
     let total_duration = start_time.elapsed();
     info!("Resolved target path: {}, relative path: {} (calc: {:.2}ms, total: {:.2}ms)", 
