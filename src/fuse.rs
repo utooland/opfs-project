@@ -8,11 +8,11 @@ use tracing::{info, instrument};
 // Create fuse link between source and destination directories
 // node_modules/@a/b/fuse.link -> /stores/@a/b/unpack
 // node_modules/@a/b/node_modules/c/fuse.link -> /stores/c/unpack
-#[instrument(skip(src, dst), fields(src = %src.as_ref().display(), dst = %dst.as_ref().display()))]
+#[instrument(level = "info", skip(src, dst), fields(src = %src.as_ref().display(), dst = %dst.as_ref().display()))]
 pub async fn fuse_link<S: AsRef<Path>, D: AsRef<Path>>(src: S, dst: D) -> Result<()> {
     let src_ref = src.as_ref();
     let dst_ref = dst.as_ref();
-    
+
     info!("Creating fuse link from {} to {}", src_ref.display(), dst_ref.display());
 
     // Create the destination directory if it doesn't exist
@@ -35,7 +35,7 @@ pub async fn fuse_link<S: AsRef<Path>, D: AsRef<Path>>(src: S, dst: D) -> Result
 // ./node_modules/@a/b/package.json -> ./node_modules/@a/b/fuse.link
 // ./node_modules/c/index.js -> ./node_modules/c/fuse.link
 // ./node_modules/c/node_modules/d/types.js -> ./node_modules/c/node_modules/d/fuse.link
-#[instrument(fields(path = %path.as_ref().display()))]
+#[instrument(level = "debug", fields(path = %path.as_ref().display()))]
 fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<std::path::PathBuf> {
     let mut current = path.as_ref();
     let mut temp = ("", "");
@@ -83,40 +83,58 @@ fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<std::path::PathBuf> {
 }
 
 /// Get the target path for a node_modules path through fuse.link
-#[instrument(fields(path = %prepared_path.as_ref().display()))]
+#[instrument(level = "info", fields(path = %prepared_path.as_ref().display()))]
 async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_path: P) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>> {
+    #[cfg(target_arch = "wasm32")]
+    let start_time = web_time::Instant::now();
+    #[cfg(not(target_arch = "wasm32"))]
+    let start_time = std::time::Instant::now();
+    
     let path_ref = prepared_path.as_ref();
 
+    // Step 1: Find fuse.link path
+    let find_link_start = start_time.elapsed();
     let fuse_link_path = match get_fuse_link_path(path_ref) {
         Some(path) => {
-            info!("Found fuse.link at {}", path.display());
+            let find_link_duration = start_time.elapsed() - find_link_start;
+            info!("Found fuse.link at {} ({:.2}ms)", path.display(), find_link_duration.as_secs_f64() * 1000.0);
             path
         },
         None => {
-            info!("No fuse.link found for path");
+            let find_link_duration = start_time.elapsed() - find_link_start;
+            info!("No fuse.link found for path ({:.2}ms)", find_link_duration.as_secs_f64() * 1000.0);
             return Ok(None);
         },
     };
 
+    // Step 2: Read fuse.link file
+    let read_link_start = start_time.elapsed();
     let link_content = match tokio_fs_ext::read_to_string(&fuse_link_path).await {
         Ok(content) => {
-            info!("Successfully read fuse.link content");
+            let read_link_duration = start_time.elapsed() - read_link_start;
+            info!("Successfully read fuse.link content ({:.2}ms)", read_link_duration.as_secs_f64() * 1000.0);
             content
         },
         Err(e) => {
-            info!("Failed to read fuse.link file: {:?}", e);
+            let read_link_duration = start_time.elapsed() - read_link_start;
+            info!("Failed to read fuse.link file: {:?} ({:.2}ms)", e, read_link_duration.as_secs_f64() * 1000.0);
             return Ok(None);
         },
     };
 
+    // Step 3: Parse target directory
+    let parse_start = start_time.elapsed();
     let target_dir = link_content.lines().next().unwrap_or("").trim();
     if target_dir.is_empty() {
-        info!("Empty target directory in fuse.link");
+        let parse_duration = start_time.elapsed() - parse_start;
+        info!("Empty target directory in fuse.link ({:.2}ms)", parse_duration.as_secs_f64() * 1000.0);
         return Ok(None);
     }
-    info!("Target directory from fuse.link: {}", target_dir);
+    let parse_duration = start_time.elapsed() - parse_start;
+    info!("Target directory from fuse.link: {} ({:.2}ms)", target_dir, parse_duration.as_secs_f64() * 1000.0);
 
-    // Calculate relative path from fuse_link_path to prepared_path
+    // Step 4: Calculate relative path from fuse_link_path to prepared_path
+    let calc_path_start = start_time.elapsed();
     let fuse_link_dir = fuse_link_path.parent().ok_or_else(|| {
         Error::new(ErrorKind::InvalidInput, "Invalid fuse.link path")
     })?;
@@ -126,33 +144,56 @@ async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_pa
     })?;
 
     let target_path = Path::new(target_dir).join(relative_path);
-    info!("Resolved target path: {}, relative path: {}", target_path.display(), relative_path.display());
+    let calc_path_duration = start_time.elapsed() - calc_path_start;
+    let total_duration = start_time.elapsed();
+    info!("Resolved target path: {}, relative path: {} (calc: {:.2}ms, total: {:.2}ms)", 
+          target_path.display(), relative_path.display(), 
+          calc_path_duration.as_secs_f64() * 1000.0, total_duration.as_secs_f64() * 1000.0);
     Ok(Some((target_path, relative_path.to_path_buf())))
 }
 
 /// Try to read file through fuse link logic for node_modules
-#[instrument(fields(path = %prepared_path.as_ref().display()))]
+#[instrument(level = "info", fields(path = %prepared_path.as_ref().display()))]
 pub(super) async fn try_read_through_fuse_link<P: AsRef<Path> + std::fmt::Debug>(
     prepared_path: P,
 ) -> Result<Option<Vec<u8>>> {
+    #[cfg(target_arch = "wasm32")]
+    let start_time = web_time::Instant::now();
+    #[cfg(not(target_arch = "wasm32"))]
+    let start_time = std::time::Instant::now();
+    
+    let resolve_start = start_time.elapsed();
     let (target_dir, _) = match get_fuse_link_target_path(&prepared_path).await? {
         Some((path, relative)) => {
-            info!("Found target path for reading: {}", path.display());
+            let resolve_duration = start_time.elapsed() - resolve_start;
+            info!("Found target path for reading: {} (fuse_resolve: {:.2}ms)", 
+                  path.display(), resolve_duration.as_secs_f64() * 1000.0);
             (path, relative)
         },
         None => {
-            info!("No fuse link target found for reading");
+            let resolve_duration = start_time.elapsed() - resolve_start;
+            info!("No fuse link target found for reading (fuse_resolve: {:.2}ms)", 
+                  resolve_duration.as_secs_f64() * 1000.0);
             return Ok(None);
         },
     };
 
+    #[cfg(target_arch = "wasm32")]
+    let read_start = web_time::Instant::now();
+    #[cfg(not(target_arch = "wasm32"))]
+    let read_start = std::time::Instant::now();
+    
     match tokio_fs_ext::read(&target_dir).await {
         Ok(content) => {
-            info!("Successfully read {} bytes through fuse link", content.len());
+            let read_duration = read_start.elapsed();
+            let total_duration = start_time.elapsed();
+            info!("Successfully read {} bytes through fuse link (read: {:.2}ms, total: {:.2}ms)", 
+                  content.len(), read_duration.as_secs_f64() * 1000.0, total_duration.as_secs_f64() * 1000.0);
             Ok(Some(content))
         },
         Err(e) => {
-            info!("Failed to read target file: {:?}", e);
+            let total_duration = start_time.elapsed();
+            info!("Failed to read target file: {:?} (total: {:.2}ms)", e, total_duration.as_secs_f64() * 1000.0);
             Ok(None)
         },
     }
@@ -160,34 +201,53 @@ pub(super) async fn try_read_through_fuse_link<P: AsRef<Path> + std::fmt::Debug>
 
 
 /// Try to read directory through fuse.link for node_modules
-#[instrument(fields(path = %prepared_path.as_ref().display()))]
+#[instrument(level = "info", fields(path = %prepared_path.as_ref().display()))]
 pub(super) async fn try_read_dir_through_fuse_link<P: AsRef<Path> + std::fmt::Debug>(
     prepared_path: P,
 ) -> Result<Option<Vec<tokio_fs_ext::DirEntry>>> {
+    #[cfg(target_arch = "wasm32")]
+    let start_time = web_time::Instant::now();
+    #[cfg(not(target_arch = "wasm32"))]
+    let start_time = std::time::Instant::now();
+    
+    let resolve_start = start_time.elapsed();
     let (target_path, _relative_path) = match get_fuse_link_target_path(&prepared_path).await? {
         Some((path, relative)) => {
-            info!("Found target path for directory reading: {}", path.display());
+            let resolve_duration = start_time.elapsed() - resolve_start;
+            info!("Found target path for directory reading: {} (resolve: {:.2}ms)", 
+                  path.display(), resolve_duration.as_secs_f64() * 1000.0);
             (path, relative)
         },
         None => {
-            info!("No fuse link target found for directory reading");
+            let resolve_duration = start_time.elapsed() - resolve_start;
+            info!("No fuse link target found for directory reading (resolve: {:.2}ms)", 
+                  resolve_duration.as_secs_f64() * 1000.0);
             return Ok(None);
         },
     };
 
+    let read_target_start = start_time.elapsed();
     let target_entries = read_dir_direct(&target_path).await?;
-    info!("Read {} entries from target directory", target_entries.len());
+    let read_target_duration = start_time.elapsed() - read_target_start;
+    info!("Read {} entries from target directory ({:.2}ms)", 
+          target_entries.len(), read_target_duration.as_secs_f64() * 1000.0);
 
     // Always read original directory and combine with target entries
     // This ensures we always see both the original content (like node_modules) and target content
     let path_ref = prepared_path.as_ref();
+    let read_orig_start = start_time.elapsed();
     let original_entries = match read_dir_direct(path_ref).await {
         Ok(entries) => {
-            info!("Read {} entries from original directory", entries.len());
+            let read_orig_duration = start_time.elapsed() - read_orig_start;
+            info!("Read {} entries from original directory ({:.2}ms)", 
+                  entries.len(), read_orig_duration.as_secs_f64() * 1000.0);
             entries
         },
         Err(e) => {
-            info!("Failed to read original directory, returning target entries only: {:?}", e);
+            let read_orig_duration = start_time.elapsed() - read_orig_start;
+            let total_duration = start_time.elapsed();
+            info!("Failed to read original directory, returning {} target entries only: {:?} (read_orig: {:.2}ms, total: {:.2}ms)", 
+                  target_entries.len(), e, read_orig_duration.as_secs_f64() * 1000.0, total_duration.as_secs_f64() * 1000.0);
             return Ok(Some(target_entries));
         },
     };
@@ -207,7 +267,10 @@ pub(super) async fn try_read_dir_through_fuse_link<P: AsRef<Path> + std::fmt::De
     // Combine original entries (including node_modules) + target entries (package content)
     let mut combined_entries = filtered_original;
     combined_entries.extend(target_entries);
-    info!("Combined {} total directory entries", combined_entries.len());
+    
+    let total_duration = start_time.elapsed();
+    info!("Combined {} total directory entries (total: {:.2}ms)", 
+          combined_entries.len(), total_duration.as_secs_f64() * 1000.0);
     Ok(Some(combined_entries))
 
 }
