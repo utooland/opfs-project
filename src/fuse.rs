@@ -3,13 +3,17 @@ use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 
 use crate::util::read_dir_direct;
+use tracing::{info, instrument};
 
 // Create fuse link between source and destination directories
 // node_modules/@a/b/fuse.link -> /stores/@a/b/unpack
 // node_modules/@a/b/node_modules/c/fuse.link -> /stores/c/unpack
+#[instrument(skip(src, dst), fields(src = %src.as_ref().display(), dst = %dst.as_ref().display()))]
 pub async fn fuse_link<S: AsRef<Path>, D: AsRef<Path>>(src: S, dst: D) -> Result<()> {
     let src_ref = src.as_ref();
     let dst_ref = dst.as_ref();
+    
+    info!("Creating fuse link from {} to {}", src_ref.display(), dst_ref.display());
 
     // Create the destination directory if it doesn't exist
     tokio_fs_ext::create_dir_all(dst_ref.to_string_lossy().as_ref()).await?;
@@ -20,8 +24,10 @@ pub async fn fuse_link<S: AsRef<Path>, D: AsRef<Path>>(src: S, dst: D) -> Result
 
     // Write the source path to the fuse.link file
     let link_content = format!("{}\n", src_ref.to_string_lossy());
+    info!("Writing fuse.link file at {}", fuse_link_path.display());
     tokio_fs_ext::write(&fuse_link_path, link_content.as_bytes()).await?;
 
+    info!("Successfully created fuse link");
     Ok(())
 }
 
@@ -29,6 +35,7 @@ pub async fn fuse_link<S: AsRef<Path>, D: AsRef<Path>>(src: S, dst: D) -> Result
 // ./node_modules/@a/b/package.json -> ./node_modules/@a/b/fuse.link
 // ./node_modules/c/index.js -> ./node_modules/c/fuse.link
 // ./node_modules/c/node_modules/d/types.js -> ./node_modules/c/node_modules/d/fuse.link
+#[instrument(fields(path = %path.as_ref().display()))]
 fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<std::path::PathBuf> {
     let mut current = path.as_ref();
     let mut temp = ("", "");
@@ -48,13 +55,19 @@ fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<std::path::PathBuf> {
                     if !temp.0.is_empty() {
                         if temp.1.is_empty() {
                             // Single component package
-                            return Some(parent.join(temp.0).join("fuse.link"));
+                            let fuse_path = parent.join(temp.0).join("fuse.link");
+                            info!("Found fuse.link path for single component: {}", fuse_path.display());
+                            return Some(fuse_path);
                         } else {
                             // Two component package (could be scope/package or package/subpath)
                             if temp.0.starts_with('@') {
-                                return Some(parent.join(temp.0).join(temp.1).join("fuse.link"));
+                                let fuse_path = parent.join(temp.0).join(temp.1).join("fuse.link");
+                                info!("Found fuse.link path for scoped package: {}", fuse_path.display());
+                                return Some(fuse_path);
                             } else {
-                                return Some(parent.join(temp.0).join("fuse.link"));
+                                let fuse_path = parent.join(temp.0).join("fuse.link");
+                                info!("Found fuse.link path for package with subpath: {}", fuse_path.display());
+                                return Some(fuse_path);
                             }
                         }
                     }
@@ -65,27 +78,43 @@ fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<std::path::PathBuf> {
         current = parent;
     }
 
+    info!("No fuse.link path found for given path");
     None
 }
 
 /// Get the target path for a node_modules path through fuse.link
-async fn get_fuse_link_target_path<P: AsRef<Path>>(prepared_path: P) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>> {
+#[instrument(fields(path = %prepared_path.as_ref().display()))]
+async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_path: P) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>> {
     let path_ref = prepared_path.as_ref();
 
     let fuse_link_path = match get_fuse_link_path(path_ref) {
-        Some(path) => path,
-        None => return Ok(None),
+        Some(path) => {
+            info!("Found fuse.link at {}", path.display());
+            path
+        },
+        None => {
+            info!("No fuse.link found for path");
+            return Ok(None);
+        },
     };
 
     let link_content = match tokio_fs_ext::read_to_string(&fuse_link_path).await {
-        Ok(content) => content,
-        Err(_) => return Ok(None),
+        Ok(content) => {
+            info!("Successfully read fuse.link content");
+            content
+        },
+        Err(e) => {
+            info!("Failed to read fuse.link file: {:?}", e);
+            return Ok(None);
+        },
     };
 
     let target_dir = link_content.lines().next().unwrap_or("").trim();
     if target_dir.is_empty() {
+        info!("Empty target directory in fuse.link");
         return Ok(None);
     }
+    info!("Target directory from fuse.link: {}", target_dir);
 
     // Calculate relative path from fuse_link_path to prepared_path
     let fuse_link_dir = fuse_link_path.parent().ok_or_else(|| {
@@ -97,42 +126,70 @@ async fn get_fuse_link_target_path<P: AsRef<Path>>(prepared_path: P) -> Result<O
     })?;
 
     let target_path = Path::new(target_dir).join(relative_path);
+    info!("Resolved target path: {}, relative path: {}", target_path.display(), relative_path.display());
     Ok(Some((target_path, relative_path.to_path_buf())))
 }
 
 /// Try to read file through fuse link logic for node_modules
-pub(super) async fn try_read_through_fuse_link<P: AsRef<Path>>(
+#[instrument(fields(path = %prepared_path.as_ref().display()))]
+pub(super) async fn try_read_through_fuse_link<P: AsRef<Path> + std::fmt::Debug>(
     prepared_path: P,
 ) -> Result<Option<Vec<u8>>> {
     let (target_dir, _) = match get_fuse_link_target_path(&prepared_path).await? {
-        Some((path, relative)) => (path, relative),
-        None => return Ok(None),
+        Some((path, relative)) => {
+            info!("Found target path for reading: {}", path.display());
+            (path, relative)
+        },
+        None => {
+            info!("No fuse link target found for reading");
+            return Ok(None);
+        },
     };
 
     match tokio_fs_ext::read(&target_dir).await {
-        Ok(content) => Ok(Some(content)),
-        Err(_) => Ok(None),
+        Ok(content) => {
+            info!("Successfully read {} bytes through fuse link", content.len());
+            Ok(Some(content))
+        },
+        Err(e) => {
+            info!("Failed to read target file: {:?}", e);
+            Ok(None)
+        },
     }
 }
 
 
 /// Try to read directory through fuse.link for node_modules
-pub(super) async fn try_read_dir_through_fuse_link<P: AsRef<Path>>(
+#[instrument(fields(path = %prepared_path.as_ref().display()))]
+pub(super) async fn try_read_dir_through_fuse_link<P: AsRef<Path> + std::fmt::Debug>(
     prepared_path: P,
 ) -> Result<Option<Vec<tokio_fs_ext::DirEntry>>> {
     let (target_path, _relative_path) = match get_fuse_link_target_path(&prepared_path).await? {
-        Some((path, relative)) => (path, relative),
-        None => return Ok(None),
+        Some((path, relative)) => {
+            info!("Found target path for directory reading: {}", path.display());
+            (path, relative)
+        },
+        None => {
+            info!("No fuse link target found for directory reading");
+            return Ok(None);
+        },
     };
 
     let target_entries = read_dir_direct(&target_path).await?;
+    info!("Read {} entries from target directory", target_entries.len());
 
     // Always read original directory and combine with target entries
     // This ensures we always see both the original content (like node_modules) and target content
     let path_ref = prepared_path.as_ref();
     let original_entries = match read_dir_direct(path_ref).await {
-        Ok(entries) => entries,
-        Err(_) => return Ok(Some(target_entries)),
+        Ok(entries) => {
+            info!("Read {} entries from original directory", entries.len());
+            entries
+        },
+        Err(e) => {
+            info!("Failed to read original directory, returning target entries only: {:?}", e);
+            return Ok(Some(target_entries));
+        },
     };
 
     // Filter out fuse.link files from original entries
@@ -150,6 +207,7 @@ pub(super) async fn try_read_dir_through_fuse_link<P: AsRef<Path>>(
     // Combine original entries (including node_modules) + target entries (package content)
     let mut combined_entries = filtered_original;
     combined_entries.extend(target_entries);
+    info!("Combined {} total directory entries", combined_entries.len());
     Ok(Some(combined_entries))
 
 }
