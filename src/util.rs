@@ -8,6 +8,9 @@ pub fn prepare_path<P: AsRef<Path>>(path: P) -> std::path::PathBuf {
 
     if path_str.starts_with('/') {
         std::path::PathBuf::from(path_str.as_ref())
+    } else if path_str.starts_with("./") {
+        let cwd = crate::get_cwd();
+        cwd.join(path_ref.strip_prefix("./").unwrap())
     } else {
         let cwd = crate::get_cwd();
         cwd.join(path_ref)
