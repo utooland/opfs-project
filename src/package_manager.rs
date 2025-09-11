@@ -12,7 +12,6 @@ use crate::package_lock::PackageLock;
 /// Download all tgz packages to OPFS
 pub async fn install_deps(package_lock: &str) -> Result<Vec<String>> {
     let lock = PackageLock::from_json(package_lock)?;
-    let project_name = lock.name.clone();
 
     // Write package.json to root
     ensure_package_json(&lock).await?;
@@ -26,10 +25,9 @@ pub async fn install_deps(package_lock: &str) -> Result<Vec<String>> {
             let name = pkg.get_name(path);
             let version = pkg.get_version();
             let tgz_url = pkg.resolved.clone();
-            let project_name = project_name.clone();
             let path_key = path.clone();
 
-            async move { install_package(&name, &version, &tgz_url, &project_name, &path_key).await }
+            async move { install_package(&name, &version, &tgz_url, &path_key).await }
         })
         .collect();
 
@@ -60,12 +58,11 @@ async fn install_package(
     name: &str,
     version: &str,
     tgz_url: &Option<String>,
-    project_name: &str,
     path_key: &str,
 ) -> String {
     match tgz_url {
         Some(url) => {
-            let paths = PackagePaths::new(name, url, project_name, path_key);
+            let paths = PackagePaths::new(name, url, path_key);
 
             // Check if already unpacked
             if tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_ok() {
@@ -113,14 +110,14 @@ struct PackagePaths {
 }
 
 impl PackagePaths {
-    fn new(name: &str, tgz_url: &str, project_name: &str, path_key: &str) -> Self {
+    fn new(name: &str, tgz_url: &str, path_key: &str) -> Self {
         let url_path: Vec<_> = tgz_url.split('/').collect();
         let tgz_file_name = url_path.last().unwrap_or(&"package.tgz");
 
         Self {
             tgz_store_path: PathBuf::from(format!("/stores/{name}/-/{tgz_file_name}")),
             unpacked_dir: PathBuf::from(format!("/stores/{name}/-/{tgz_file_name}-unpack")),
-            link_target_dir: PathBuf::from(format!("/{project_name}/{path_key}")),
+            link_target_dir: PathBuf::from(format!("{path_key}")),
         }
     }
 }
@@ -255,7 +252,6 @@ mod tests {
         let paths = PackagePaths::new(
             "lodash",
             "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
-            "test-project",
             "node_modules/lodash",
         );
 
@@ -264,7 +260,7 @@ mod tests {
             paths.unpacked_dir.to_string_lossy(),
             "/stores/lodash/-/lodash-4.17.21.tgz-unpack"
         );
-        assert_eq!(paths.link_target_dir.to_string_lossy(), "/test-project/node_modules/lodash");
+        assert_eq!(paths.link_target_dir.to_string_lossy(), "node_modules/lodash");
     }
 
     #[wasm_bindgen_test]
@@ -273,7 +269,6 @@ mod tests {
         let paths = PackagePaths::new(
             "@types/node",
             "https://registry.npmjs.org/@types/node/-/node-18.0.0.tgz",
-            "my-project",
             "node_modules/@types/node",
         );
 
@@ -285,7 +280,7 @@ mod tests {
             paths.unpacked_dir.to_string_lossy(),
             "/stores/@types/node/-/node-18.0.0.tgz-unpack"
         );
-        assert_eq!(paths.link_target_dir.to_string_lossy(), "/my-project/node_modules/@types/node");
+        assert_eq!(paths.link_target_dir.to_string_lossy(), "node_modules/@types/node");
     }
 
     #[wasm_bindgen_test]
@@ -365,7 +360,6 @@ mod tests {
             "lodash",
             "4.17.21",
             &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
-            "test-project",
             "node_modules/lodash",
         )
         .await;
@@ -377,7 +371,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_install_package_without_url() {
 
-        let result = install_package("lodash", "4.17.21", &None, "test-project", "node_modules/lodash").await;
+        let result = install_package("lodash", "4.17.21", &None, "node_modules/lodash").await;
 
         assert_eq!(result, "lodash@4.17.21: no resolved field");
     }
