@@ -1,15 +1,15 @@
 
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
-use std::collections::{BTreeMap};
+use std::collections::HashMap;
 use std::sync::{RwLock, LazyLock};
 
 use crate::util::read_dir_direct;
-use tracing::info;
+use tracing::{info, error};
 
 // Global cache for fuse.link mappings to avoid repeated file reads
 // Key: fuse.link file path, Value: target directory path
-static FUSE_LINK_CACHE: LazyLock<RwLock<BTreeMap<PathBuf, String>>> = LazyLock::new(|| RwLock::new(BTreeMap::new()));
+static FUSE_LINK_CACHE: LazyLock<RwLock<HashMap<PathBuf, String>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 
 // Create fuse link between source and destination directories
 // node_modules/@a/b/fuse.link -> /stores/@a/b/unpack
@@ -21,7 +21,7 @@ pub async fn fuse_link<S: AsRef<Path>, D: AsRef<Path>>(src: S, dst: D) -> Result
     info!("Creating fuse link from {} to {}", src_ref.display(), dst_ref.display());
 
     // Create the destination directory if it doesn't exist
-    tokio_fs_ext::create_dir_all(dst_ref.to_string_lossy().as_ref()).await?;
+    tokio_fs_ext::create_dir_all(dst_ref).await?;
 
     // Get the fuse.link path for the destination directory
     let fuse_link_path = get_fuse_link_path(dst_ref)
@@ -115,7 +115,7 @@ async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_pa
                     content
                 },
                 Err(e) => {
-                    info!("Failed to read fuse.link file: {:?}", e);
+                    error!("Failed to read fuse.link file: {:?}", e);
                     return Ok(None);
                 },
             };
@@ -142,7 +142,7 @@ async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_pa
                 content
             },
             Err(e) => {
-                info!("Failed to read fuse.link file: {:?}", e);
+                error!("Failed to read fuse.link file: {:?}", e);
                 return Ok(None);
             },
         };
@@ -202,7 +202,7 @@ pub(super) async fn try_read_through_fuse_link<P: AsRef<Path> + std::fmt::Debug>
             Ok(Some(content))
         },
         Err(e) => {
-            info!("Failed to read target file: {:?}", e);
+            error!("Failed to read target file: {:?}", e);
             Ok(None)
         },
     }
