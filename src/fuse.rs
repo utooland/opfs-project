@@ -2,14 +2,14 @@
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
 use std::collections::{BTreeMap};
-use std::sync::{Mutex, LazyLock};
+use std::sync::{RwLock, LazyLock};
 
 use crate::util::read_dir_direct;
 use tracing::info;
 
 // Global cache for fuse.link mappings to avoid repeated file reads
 // Key: fuse.link file path, Value: target directory path
-static FUSE_LINK_CACHE: LazyLock<Mutex<BTreeMap<PathBuf, String>>> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static FUSE_LINK_CACHE: LazyLock<RwLock<BTreeMap<PathBuf, String>>> = LazyLock::new(|| RwLock::new(BTreeMap::new()));
 
 // Create fuse link between source and destination directories
 // node_modules/@a/b/fuse.link -> /stores/@a/b/unpack
@@ -33,7 +33,7 @@ pub async fn fuse_link<S: AsRef<Path>, D: AsRef<Path>>(src: S, dst: D) -> Result
     tokio_fs_ext::write(&fuse_link_path, link_content.as_bytes()).await?;
 
     // Cache the mapping for future reads
-    if let Ok(mut cache) = FUSE_LINK_CACHE.lock() {
+    if let Ok(mut cache) = FUSE_LINK_CACHE.write() {
         cache.insert(fuse_link_path.clone(), src_ref.to_string_lossy().to_string());
         info!("Cached fuse link mapping: {} -> {}", fuse_link_path.display(), src_ref.display());
     }
@@ -103,7 +103,7 @@ async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_pa
     };
 
     // Step 2: Check cache first, then read fuse.link file
-    let target_dir = if let Ok(cache) = FUSE_LINK_CACHE.lock() {
+    let target_dir = if let Ok(cache) = FUSE_LINK_CACHE.read() {
         if let Some(cached_target) = cache.get(&fuse_link_path) {
             cached_target.clone()
         } else {
@@ -127,7 +127,7 @@ async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_pa
             }
 
             // Update cache
-            if let Ok(mut cache) = FUSE_LINK_CACHE.lock() {
+            if let Ok(mut cache) = FUSE_LINK_CACHE.write() {
                 cache.insert(fuse_link_path.clone(), target_dir.clone());
                 info!("Cached new fuse link mapping after read");
             }
