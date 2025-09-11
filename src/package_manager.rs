@@ -189,7 +189,7 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
 mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
     use super::*;
-    use crate::{package_lock::{LockPackage, PackageLock}, set_cwd, test_utils};
+    use crate::{package_lock::{LockPackage, PackageLock}, set_cwd};
 
     use wasm_bindgen_test::*;
 

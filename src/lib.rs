@@ -106,15 +106,14 @@ pub mod test_utils {
                 use tracing_subscriber::{
                     fmt::{
                         self,
-                        format::{FmtSpan, Pretty},
+                        format::FmtSpan,
                     },
                     layer::SubscriberExt,
                     registry,
                     util::SubscriberInitExt,
-                    Layer,
                 };
 
-                use tracing_web::{performance_layer, MakeWebConsoleWriter};
+                use tracing_web::MakeWebConsoleWriter;
 
                 let fmt_layer = fmt::layer()
                 .without_time()

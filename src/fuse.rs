@@ -1,7 +1,7 @@
 
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
+use std::collections::{BTreeMap};
 use std::sync::{Mutex, LazyLock};
 
 use crate::util::read_dir_direct;
@@ -9,7 +9,7 @@ use tracing::info;
 
 // Global cache for fuse.link mappings to avoid repeated file reads
 // Key: fuse.link file path, Value: target directory path
-static FUSE_LINK_CACHE: LazyLock<Mutex<HashMap<PathBuf, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static FUSE_LINK_CACHE: LazyLock<Mutex<BTreeMap<PathBuf, String>>> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 // Create fuse link between source and destination directories
 // node_modules/@a/b/fuse.link -> /stores/@a/b/unpack
@@ -49,15 +49,6 @@ pub async fn fuse_link<S: AsRef<Path>, D: AsRef<Path>>(src: S, dst: D) -> Result
 fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<std::path::PathBuf> {
     let mut current = path.as_ref();
     let mut temp = ("", "");
-
-    // find in cache first
-    // if let Ok(cache) = FUSE_LINK_CACHE.lock() {
-    //     if let Some(fuse_link_path) = cache.keys().find(|key| current.starts_with(key.parent().unwrap())) {
-    //         info!("Found fuse.link path in cache: {}, content: {}", fuse_link_path.display(), cache.get(fuse_link_path).unwrap());
-    //         return Some(fuse_link_path.clone());
-    //     }
-    // }
-
     // Walk up the path tree to find node_modules
     while let Some(parent) = current.parent() {
         if let Some(file_name) = current.file_name() {
@@ -701,5 +692,43 @@ mod tests {
         let path = Path::new("/node_modules/@types/node/fs/promises.d.ts");
         let result = get_fuse_link_path(path);
         assert_eq!(result, Some(Path::new("/node_modules/@types/node/fuse.link").to_path_buf()));
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_nested_fuse_link_priority() {
+        test_utils::init_tracing();
+
+        // Test that nested paths are matched with priority (longest path first)
+        // Create a nested structure like:
+        // /utooweb-demo/node_modules/rc-picker/fuse.link
+        // /utooweb-demo/node_modules/rc-picker/node_modules/@a/b/fuse.link
+
+        let base_path = create_test_dir("test-nested-priority").await;
+        let outer_src = format!("{}/stores/rc-picker/unpack", base_path);
+        let inner_src = format!("{}/stores/@a/b/unpack", base_path);
+        let outer_dst = format!("{}/node_modules/rc-picker", base_path);
+        let inner_dst = format!("{}/node_modules/rc-picker/node_modules/@a/b", base_path);
+
+        // Create source directories
+        tokio_fs_ext::create_dir_all(&outer_src).await.unwrap();
+        tokio_fs_ext::create_dir_all(&inner_src).await.unwrap();
+        tokio_fs_ext::write(format!("{}/package.json", outer_src), b"{\"name\":\"rc-picker\"}").await.unwrap();
+        tokio_fs_ext::write(format!("{}/package.json", inner_src), b"{\"name\":\"@a/b\"}").await.unwrap();
+
+        // Create fuse links (outer first, then inner)
+        fuse_link(&outer_src, &outer_dst).await.unwrap();
+        fuse_link(&inner_src, &inner_dst).await.unwrap();
+
+        // Test that accessing a file in the nested package returns the nested fuse.link path
+        let test_file = format!("{}/node_modules/rc-picker/node_modules/@a/b/index.js", base_path);
+        let result = get_fuse_link_path(&test_file);
+
+        // Should match the longer, more specific path
+        let expected = format!("{}/node_modules/rc-picker/node_modules/@a/b/fuse.link", base_path);
+        assert_eq!(result, Some(PathBuf::from(expected)));
+
+        // Verify we can actually read through the nested fuse link
+        let content = crate::read(format!("{}/package.json", inner_dst)).await.unwrap();
+        assert_eq!(content, b"{\"name\":\"@a/b\"}");
     }
 }
