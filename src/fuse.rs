@@ -159,30 +159,21 @@ async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_pa
         Error::new(ErrorKind::InvalidInput, "Invalid fuse.link path")
     })?;
 
-    // Fast path: direct string manipulation to avoid PathBuf allocations
-    let fuse_link_dir_str = fuse_link_dir.to_string_lossy();
-    let path_str = path_ref.to_string_lossy();
-
-    // Quick prefix check and slice
-    if !path_str.starts_with(&*fuse_link_dir_str) {
-        return Err(Error::new(ErrorKind::InvalidInput, "Path is not under fuse.link directory"));
-    }
-
-    let mut rel_start = fuse_link_dir_str.len();
-    if path_str.len() > rel_start && (path_str.chars().nth(rel_start) == Some('/') || path_str.chars().nth(rel_start) == Some('\\')) {
-        rel_start += 1;
-    }
-    let relative_str = &path_str[rel_start..];
-
-    // Direct concatenation
-    let target_path_str = if relative_str.is_empty() {
-        target_dir.clone()
-    } else {
-        format!("{}/{}", target_dir, relative_str)
+    // Use standard library's optimized path operations for robust relative path calculation
+    let relative_path = match path_ref.strip_prefix(fuse_link_dir) {
+        Ok(rel) => rel,
+        Err(_) => {
+            return Err(Error::new(ErrorKind::InvalidInput, "Path is not under fuse.link directory"));
+        }
     };
 
-    let target_path = PathBuf::from(target_path_str);
-    let relative_path = PathBuf::from(relative_str);
+    // Construct target path by joining target directory with relative path
+    let target_path = if relative_path.as_os_str().is_empty() {
+        PathBuf::from(target_dir)
+    } else {
+        PathBuf::from(&target_dir).join(relative_path)
+    };
+
     Ok(Some((target_path, relative_path.to_path_buf())))
 }
 
