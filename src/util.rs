@@ -8,6 +8,9 @@ pub fn prepare_path<P: AsRef<Path>>(path: P) -> std::path::PathBuf {
 
     if path_str.starts_with('/') {
         std::path::PathBuf::from(path_str.as_ref())
+    } else if path_str.starts_with("./") {
+        let cwd = crate::get_cwd();
+        cwd.join(path_ref.strip_prefix("./").unwrap())
     } else {
         let cwd = crate::get_cwd();
         cwd.join(path_ref)
@@ -53,6 +56,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_prepare_path_relative() {
+
         // Since CWD is managed globally and has a default value,
         // we'll test that relative paths are properly concatenated
         // by checking the structure rather than exact values
@@ -61,7 +65,7 @@ mod tests {
             "file.txt",
             "src/main.rs",
             "../parent/file.js",
-            "./current/file.py",
+            "current/file.py",
         ];
 
         for relative_path in test_cases {
@@ -87,6 +91,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_prepare_path_empty() {
+
         let result = prepare_path("");
         let result_str = result.to_string_lossy();
 
@@ -106,6 +111,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_read_dir_direct() {
+
         let temp_path = "/test-read-dir-direct".to_string();
         tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
 
@@ -160,6 +166,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_read_dir_direct_empty_directory() {
+
         let temp_path = "/test-read-dir-empty".to_string();
         tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
 
@@ -171,12 +178,14 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_read_dir_direct_nonexistent_directory() {
+
         let result = read_dir_direct("/nonexistent/directory/path").await;
         assert!(result.is_err());
     }
 
     #[wasm_bindgen_test]
     async fn test_read_dir_direct_with_hidden_files() {
+
         let temp_path = "/test-read-dir-hidden".to_string();
         tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
 
@@ -206,6 +215,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_read_dir_direct_with_special_characters() {
+
         let temp_path = "/test-read-dir-special".to_string();
         tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
 

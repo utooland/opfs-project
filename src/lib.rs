@@ -91,3 +91,37 @@ pub fn set_cwd(path: impl AsRef<Path>) {
 pub fn get_cwd() -> PathBuf {
     tokio_fs_ext::current_dir().unwrap()
 }
+
+#[cfg(test)]
+pub mod test_utils {
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+
+    /// Initialize tracing-web for tests
+    /// This should be called at the beginning of each test to enable web console logging
+    pub fn init_tracing() {
+        INIT.call_once(|| {
+            {
+                use tracing_subscriber::{
+                    fmt::{
+                        self,
+                        format::FmtSpan,
+                    },
+                    layer::SubscriberExt,
+                    registry,
+                    util::SubscriberInitExt,
+                };
+
+                use tracing_web::MakeWebConsoleWriter;
+
+                let fmt_layer = fmt::layer()
+                .without_time()
+                .with_span_events(FmtSpan::CLOSE)
+                .with_writer(MakeWebConsoleWriter::new());
+
+            registry().with(fmt_layer).init();
+            }
+        });
+    }
+}
