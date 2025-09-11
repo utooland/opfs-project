@@ -189,7 +189,7 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
 mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
     use super::*;
-    use crate::{package_lock::{LockPackage, PackageLock}, set_cwd};
+    use crate::{package_lock::{LockPackage, PackageLock}, set_cwd, test_utils};
 
     use wasm_bindgen_test::*;
 
@@ -251,6 +251,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_package_paths_new() {
+
         let paths = PackagePaths::new(
             "lodash",
             "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
@@ -268,6 +269,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_package_paths_new_with_complex_url() {
+
         let paths = PackagePaths::new(
             "@types/node",
             "https://registry.npmjs.org/@types/node/-/node-18.0.0.tgz",
@@ -288,6 +290,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_extract_tgz_bytes_simple() {
+
         let extract_dir = PathBuf::from("/test-extract-simple");
         tokio_fs_ext::create_dir_all(&extract_dir).await.unwrap();
 
@@ -310,6 +313,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_extract_tgz_bytes_with_package_prefix() {
+
         let extract_dir = PathBuf::from("/test-extract-prefix");
         tokio_fs_ext::create_dir_all(&extract_dir).await.unwrap();
 
@@ -343,6 +347,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_extract_tgz_bytes_invalid_data() {
+
         let extract_dir = PathBuf::from("/test-extract-invalid");
         tokio_fs_ext::create_dir_all(&extract_dir).await.unwrap();
 
@@ -355,6 +360,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_install_package_with_url() {
+
         let result = install_package(
             "lodash",
             "4.17.21",
@@ -370,6 +376,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_install_package_without_url() {
+
         let result = install_package("lodash", "4.17.21", &None, "test-project", "node_modules/lodash").await;
 
         assert_eq!(result, "lodash@4.17.21: no resolved field");
@@ -377,6 +384,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_ensure_package_json_new_project() {
+
         let project_name = PathBuf::from("/test-project-new");
         set_cwd("/test-project-new");
         tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
@@ -397,6 +405,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_ensure_package_json_existing_project() {
+
         let project_name = PathBuf::from("/test-project-existing");
         tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
 
@@ -418,6 +427,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_install_deps_with_valid_lock() {
+
         let lock = create_test_package_lock();
         let lock_json = serde_json::to_string(&lock).unwrap();
 
@@ -436,6 +446,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_install_deps_with_invalid_lock() {
+
         let invalid_lock_json = "{ invalid json }";
 
         let result = install_deps(invalid_lock_json).await;
@@ -444,6 +455,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_opfs_write() {
+
         let test_file = PathBuf::from("/test-opfs-write.txt");
         let content = "Hello, OPFS!";
 
@@ -455,6 +467,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_install_deps_empty_packages() {
+
         let mut lock = create_test_package_lock();
         lock.packages.clear();
         lock.packages.insert(
@@ -490,6 +503,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_nested_node_modules_structure() {
+
         set_cwd("/nested-test-project");
         // Create a package lock with three-level nested structure
         let mut packages = std::collections::HashMap::new();

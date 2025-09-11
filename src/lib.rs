@@ -92,14 +92,37 @@ pub fn get_cwd() -> PathBuf {
     tokio_fs_ext::current_dir().unwrap()
 }
 
-/// Clear the internal fuse.link cache to free memory
-/// This is useful for long-running applications or testing
-pub fn clear_fuse_cache() {
-    fuse::clear_fuse_link_cache();
-}
+#[cfg(test)]
+pub mod test_utils {
+    use std::sync::Once;
 
-/// Get fuse cache statistics for monitoring
-/// Returns (cache_size, list_of_cached_paths)
-pub fn get_fuse_cache_stats() -> (usize, Vec<String>) {
-    fuse::get_cache_stats()
+    static INIT: Once = Once::new();
+
+    /// Initialize tracing-web for tests
+    /// This should be called at the beginning of each test to enable web console logging
+    pub fn init_tracing() {
+        INIT.call_once(|| {
+            {
+                use tracing_subscriber::{
+                    fmt::{
+                        self,
+                        format::{FmtSpan, Pretty},
+                    },
+                    layer::SubscriberExt,
+                    registry,
+                    util::SubscriberInitExt,
+                    Layer,
+                };
+
+                use tracing_web::{performance_layer, MakeWebConsoleWriter};
+
+                let fmt_layer = fmt::layer()
+                .without_time()
+                .with_span_events(FmtSpan::CLOSE)
+                .with_writer(MakeWebConsoleWriter::new());
+
+            registry().with(fmt_layer).init();
+            }
+        });
+    }
 }

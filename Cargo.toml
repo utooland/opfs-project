@@ -31,6 +31,7 @@ web-time = "1.0"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+tracing-subscriber = "0.3.19"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

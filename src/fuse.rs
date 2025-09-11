@@ -5,15 +5,11 @@ use std::collections::HashMap;
 use std::sync::{Mutex, LazyLock};
 
 use crate::util::read_dir_direct;
-use tracing::{info, instrument};
+use tracing::info;
 
 // Global cache for fuse.link mappings to avoid repeated file reads
 // Key: fuse.link file path, Value: target directory path
 static FUSE_LINK_CACHE: LazyLock<Mutex<HashMap<PathBuf, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-// Cache for resolved paths to avoid repeated path calculations
-// Key: (fuse_link_dir, prepared_path), Value: (target_path, relative_path)
-static PATH_RESOLVE_CACHE: LazyLock<Mutex<HashMap<(PathBuf, PathBuf), (PathBuf, PathBuf)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // Create fuse link between source and destination directories
 // node_modules/@a/b/fuse.link -> /stores/@a/b/unpack
@@ -46,31 +42,6 @@ pub async fn fuse_link<S: AsRef<Path>, D: AsRef<Path>>(src: S, dst: D) -> Result
     Ok(())
 }
 
-/// Clear the fuse.link cache (useful for testing or memory management)
-pub fn clear_fuse_link_cache() {
-    if let Ok(mut cache) = FUSE_LINK_CACHE.lock() {
-        let count = cache.len();
-        cache.clear();
-        info!("Cleared {} cached fuse.link mappings", count);
-    }
-    if let Ok(mut cache) = PATH_RESOLVE_CACHE.lock() {
-        let count = cache.len();
-        cache.clear();
-        info!("Cleared {} cached path resolutions", count);
-    }
-}
-
-/// Get cache statistics (for debugging/monitoring)
-pub fn get_cache_stats() -> (usize, Vec<String>) {
-    if let Ok(cache) = FUSE_LINK_CACHE.lock() {
-        let count = cache.len();
-        let paths: Vec<String> = cache.keys().map(|p| p.to_string_lossy().to_string()).collect();
-        (count, paths)
-    } else {
-        (0, vec![])
-    }
-}
-
 // Get fuse.link path for a given path that contains node_modules
 // ./node_modules/@a/b/package.json -> ./node_modules/@a/b/fuse.link
 // ./node_modules/c/index.js -> ./node_modules/c/fuse.link
@@ -79,14 +50,13 @@ fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<std::path::PathBuf> {
     let mut current = path.as_ref();
     let mut temp = ("", "");
 
-    let start_time = web_time::Instant::now();
     // find in cache first
-    if let Ok(cache) = FUSE_LINK_CACHE.lock() {
-        if let Some(fuse_link_path) = cache.keys().find(|key| current.starts_with(key.parent().unwrap())) {
-            info!("Found fuse.link path in cache: {}, took {:?}", fuse_link_path.display(), start_time.elapsed());
-            return Some(fuse_link_path.clone());
-        }
-    }
+    // if let Ok(cache) = FUSE_LINK_CACHE.lock() {
+    //     if let Some(fuse_link_path) = cache.keys().find(|key| current.starts_with(key.parent().unwrap())) {
+    //         info!("Found fuse.link path in cache: {}, content: {}", fuse_link_path.display(), cache.get(fuse_link_path).unwrap());
+    //         return Some(fuse_link_path.clone());
+    //     }
+    // }
 
     // Walk up the path tree to find node_modules
     while let Some(parent) = current.parent() {
@@ -132,36 +102,29 @@ fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<std::path::PathBuf> {
 
 /// Get the target path for a node_modules path through fuse.link
 async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_path: P) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>> {
-    #[cfg(target_arch = "wasm32")]
-    let start_time = web_time::Instant::now();
-    #[cfg(not(target_arch = "wasm32"))]
-    let start_time = std::time::Instant::now();
 
     let path_ref = prepared_path.as_ref();
 
-    // Step 1: Find fuse.link path - streamlined  
+    // Step 1: Find fuse.link path - streamlined
     let fuse_link_path = match get_fuse_link_path(path_ref) {
         Some(path) => path,
         None => return Ok(None),
     };
 
-    // Step 2: Check cache first, then read fuse.link file  
+    // Step 2: Check cache first, then read fuse.link file
     let target_dir = if let Ok(cache) = FUSE_LINK_CACHE.lock() {
         if let Some(cached_target) = cache.get(&fuse_link_path) {
             cached_target.clone()
         } else {
             drop(cache); // Release lock before async operation
 
-            let read_link_start = start_time.elapsed();
             let link_content = match tokio_fs_ext::read_to_string(&fuse_link_path).await {
                 Ok(content) => {
-                    let read_link_duration = start_time.elapsed() - read_link_start;
-                    info!("Cache miss - read fuse.link content ({:.2}ms)", read_link_duration.as_secs_f64() * 1000.0);
+                    info!("Cache miss - read fuse.link content");
                     content
                 },
                 Err(e) => {
-                    let read_link_duration = start_time.elapsed() - read_link_start;
-                    info!("Failed to read fuse.link file: {:?} ({:.2}ms)", e, read_link_duration.as_secs_f64() * 1000.0);
+                    info!("Failed to read fuse.link file: {:?}", e);
                     return Ok(None);
                 },
             };
@@ -182,16 +145,13 @@ async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_pa
         }
     } else {
         // Fallback to direct file read if cache lock fails
-        let read_link_start = start_time.elapsed();
         let link_content = match tokio_fs_ext::read_to_string(&fuse_link_path).await {
             Ok(content) => {
-                let read_link_duration = start_time.elapsed() - read_link_start;
-                info!("Cache unavailable - read fuse.link content ({:.2}ms)", read_link_duration.as_secs_f64() * 1000.0);
+                info!("Cache unavailable - read fuse.link content");
                 content
             },
             Err(e) => {
-                let read_link_duration = start_time.elapsed() - read_link_start;
-                info!("Failed to read fuse.link file: {:?} ({:.2}ms)", e, read_link_duration.as_secs_f64() * 1000.0);
+                info!("Failed to read fuse.link file: {:?}", e);
                 return Ok(None);
             },
         };
@@ -211,25 +171,25 @@ async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_pa
     // Fast path: direct string manipulation to avoid PathBuf allocations
     let fuse_link_dir_str = fuse_link_dir.to_string_lossy();
     let path_str = path_ref.to_string_lossy();
-    
+
     // Quick prefix check and slice
     if !path_str.starts_with(&*fuse_link_dir_str) {
         return Err(Error::new(ErrorKind::InvalidInput, "Path is not under fuse.link directory"));
     }
-    
+
     let mut rel_start = fuse_link_dir_str.len();
     if path_str.len() > rel_start && (path_str.chars().nth(rel_start) == Some('/') || path_str.chars().nth(rel_start) == Some('\\')) {
         rel_start += 1;
     }
     let relative_str = &path_str[rel_start..];
-    
+
     // Direct concatenation
     let target_path_str = if relative_str.is_empty() {
         target_dir.clone()
     } else {
         format!("{}/{}", target_dir, relative_str)
     };
-    
+
     let target_path = PathBuf::from(target_path_str);
     let relative_path = PathBuf::from(relative_str);
     Ok(Some((target_path, relative_path.to_path_buf())))
@@ -239,43 +199,28 @@ async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_pa
 pub(super) async fn try_read_through_fuse_link<P: AsRef<Path> + std::fmt::Debug>(
     prepared_path: P,
 ) -> Result<Option<Vec<u8>>> {
-    #[cfg(target_arch = "wasm32")]
-    let start_time = web_time::Instant::now();
-    #[cfg(not(target_arch = "wasm32"))]
-    let start_time = std::time::Instant::now();
 
-    let resolve_start = start_time.elapsed();
     let (target_dir, _) = match get_fuse_link_target_path(&prepared_path).await? {
         Some((path, relative)) => {
-            let resolve_duration = start_time.elapsed() - resolve_start;
-            info!("Found target path for reading: {} (fuse_resolve: {:.2}ms)",
-                  path.display(), resolve_duration.as_secs_f64() * 1000.0);
+            info!("Found target path for reading: {}",
+                  path.display());
             (path, relative)
         },
         None => {
-            let resolve_duration = start_time.elapsed() - resolve_start;
-            info!("No fuse link target found for reading (fuse_resolve: {:.2}ms)",
-                  resolve_duration.as_secs_f64() * 1000.0);
+            info!("No fuse link target found for reading");
             return Ok(None);
         },
     };
 
-    #[cfg(target_arch = "wasm32")]
-    let read_start = web_time::Instant::now();
-    #[cfg(not(target_arch = "wasm32"))]
-    let read_start = std::time::Instant::now();
 
     match tokio_fs_ext::read(&target_dir).await {
         Ok(content) => {
-            let read_duration = read_start.elapsed();
-            let total_duration = start_time.elapsed();
-            info!("Successfully read {} bytes through fuse link (read: {:.2}ms, total: {:.2}ms)",
-                  content.len(), read_duration.as_secs_f64() * 1000.0, total_duration.as_secs_f64() * 1000.0);
+            info!("Successfully read {} bytes through fuse link",
+                  content.len());
             Ok(Some(content))
         },
         Err(e) => {
-            let total_duration = start_time.elapsed();
-            info!("Failed to read target file: {:?} (total: {:.2}ms)", e, total_duration.as_secs_f64() * 1000.0);
+            info!("Failed to read target file: {:?}", e);
             Ok(None)
         },
     }
@@ -286,49 +231,35 @@ pub(super) async fn try_read_through_fuse_link<P: AsRef<Path> + std::fmt::Debug>
 pub(super) async fn try_read_dir_through_fuse_link<P: AsRef<Path> + std::fmt::Debug>(
     prepared_path: P,
 ) -> Result<Option<Vec<tokio_fs_ext::DirEntry>>> {
-    #[cfg(target_arch = "wasm32")]
-    let start_time = web_time::Instant::now();
-    #[cfg(not(target_arch = "wasm32"))]
-    let start_time = std::time::Instant::now();
 
-    let resolve_start = start_time.elapsed();
     let (target_path, _relative_path) = match get_fuse_link_target_path(&prepared_path).await? {
         Some((path, relative)) => {
-            let resolve_duration = start_time.elapsed() - resolve_start;
-            info!("Found target path for directory reading: {} (resolve: {:.2}ms)",
-                  path.display(), resolve_duration.as_secs_f64() * 1000.0);
+            info!("Found target path for directory reading: {}",
+                  path.display());
             (path, relative)
         },
         None => {
-            let resolve_duration = start_time.elapsed() - resolve_start;
-            info!("No fuse link target found for directory reading (resolve: {:.2}ms)",
-                  resolve_duration.as_secs_f64() * 1000.0);
+            info!("No fuse link target found for directory reading");
             return Ok(None);
         },
     };
 
-    let read_target_start = start_time.elapsed();
     let target_entries = read_dir_direct(&target_path).await?;
-    let read_target_duration = start_time.elapsed() - read_target_start;
-    info!("Read {} entries from target directory ({:.2}ms)",
-          target_entries.len(), read_target_duration.as_secs_f64() * 1000.0);
+    info!("Read {} entries from target directory",
+          target_entries.len());
 
     // Always read original directory and combine with target entries
     // This ensures we always see both the original content (like node_modules) and target content
     let path_ref = prepared_path.as_ref();
-    let read_orig_start = start_time.elapsed();
     let original_entries = match read_dir_direct(path_ref).await {
         Ok(entries) => {
-            let read_orig_duration = start_time.elapsed() - read_orig_start;
-            info!("Read {} entries from original directory ({:.2}ms)",
-                  entries.len(), read_orig_duration.as_secs_f64() * 1000.0);
+            info!("Read {} entries from original directory",
+                  entries.len());
             entries
         },
         Err(e) => {
-            let read_orig_duration = start_time.elapsed() - read_orig_start;
-            let total_duration = start_time.elapsed();
-            info!("Failed to read original directory, returning {} target entries only: {:?} (read_orig: {:.2}ms, total: {:.2}ms)",
-                  target_entries.len(), e, read_orig_duration.as_secs_f64() * 1000.0, total_duration.as_secs_f64() * 1000.0);
+            info!("Failed to read original directory, returning {} target entries only: {:?}",
+                  target_entries.len(), e);
             return Ok(Some(target_entries));
         },
     };
@@ -349,16 +280,18 @@ pub(super) async fn try_read_dir_through_fuse_link<P: AsRef<Path> + std::fmt::De
     let mut combined_entries = filtered_original;
     combined_entries.extend(target_entries);
 
-    let total_duration = start_time.elapsed();
-    info!("Combined {} total directory entries (total: {:.2}ms)",
-          combined_entries.len(), total_duration.as_secs_f64() * 1000.0);
+    info!("Combined {} total directory entries",
+          combined_entries.len());
     Ok(Some(combined_entries))
 
 }
 
 #[cfg(test)]
 mod tests {
+
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
+    use crate::test_utils;
+
     use super::*;
 
     use wasm_bindgen_test::*;
@@ -385,6 +318,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_simplified_fuse_link_basic() {
+
         let base_path = create_test_dir("test-simplified-fuse-link-basic").await;
         let src_path = format!("{}/stores/a/unpack", base_path);
         let dst_path = format!("{}/node_modules/a", base_path);
@@ -409,6 +343,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_simplified_fuse_link_scoped_package() {
+
         let base_path = create_test_dir("test-simplified-fuse-link-scoped").await;
         let src_path = format!("{}/stores/@a/b/unpack", base_path);
         let dst_path = format!("{}/node_modules/@a/b", base_path);
@@ -433,6 +368,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_fuse_link_combine_logic() {
+
         let base_path = create_test_dir("test-fuse-link-combine").await;
 
         // Create the structure:
@@ -548,6 +484,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_simplified_fuse_link_nested_structure() {
+
         let base_path = create_test_dir("test-simplified-fuse-link-nested").await;
 
         // Test nested structure: a depends on b
@@ -613,6 +550,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_simplified_fuse_link_deep_nested() {
+
         let base_path = create_test_dir("test-simplified-fuse-link-deep-nested").await;
 
         // Test deep nested structure: a -> b -> c
@@ -646,6 +584,9 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_simplified_fuse_link_scoped_nested() {
+
+        test_utils::init_tracing();
+
         let base_path = create_test_dir("test-simplified-fuse-link-scoped-nested").await;
 
         // Test scoped package with nested dependency
@@ -674,6 +615,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_get_fuse_link_path_basic() {
+
         // Test basic package: ./node_modules/c/index.js -> ./node_modules/c/fuse.link
         let path = Path::new("./node_modules/c/index.js");
         let result = get_fuse_link_path(path);
@@ -682,6 +624,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_get_fuse_link_path_scoped() {
+
         // Test scoped package: ./node_modules/@a/b/package.json -> ./node_modules/@a/b/fuse.link
         let path = Path::new("./node_modules/@a/b/package.json");
         let result = get_fuse_link_path(path);
@@ -690,6 +633,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_get_fuse_link_path_nested() {
+
         // Test nested node_modules: ./node_modules/c/node_modules/d/types.js -> ./node_modules/c/node_modules/d/fuse.link
         let path = Path::new("./node_modules/c/node_modules/d/types.js");
         let result = get_fuse_link_path(path);
@@ -698,6 +642,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_get_fuse_link_path_scoped_nested() {
+
         // Test nested scoped package: ./node_modules/@a/b/node_modules/@c/d/index.js -> ./node_modules/@a/b/node_modules/@c/d/fuse.link
         let path = Path::new("./node_modules/@a/b/node_modules/@c/d/index.js");
         let result = get_fuse_link_path(path);
@@ -706,6 +651,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_get_fuse_link_path_deep_nested() {
+
         // Test deep nested: ./node_modules/a/node_modules/b/node_modules/c/package.json -> ./node_modules/a/node_modules/b/node_modules/c/fuse.link
         let path = Path::new("./node_modules/a/node_modules/b/node_modules/c/package.json");
         let result = get_fuse_link_path(path);
@@ -714,6 +660,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_get_fuse_link_path_no_node_modules() {
+
         // Test path without node_modules
         let path = Path::new("./some/other/path/file.js");
         let result = get_fuse_link_path(path);
@@ -722,6 +669,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_get_fuse_link_path_direct_node_modules() {
+
         // Test direct node_modules path: ./node_modules/a -> ./node_modules/a/fuse.link
         let path = Path::new("./node_modules/a");
         let result = get_fuse_link_path(path);
@@ -730,6 +678,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_get_fuse_link_path_scoped_direct() {
+
         // Test direct scoped path: ./node_modules/@a/b -> ./node_modules/@a/b/fuse.link
         let path = Path::new("./node_modules/@a/b");
         let result = get_fuse_link_path(path);
@@ -738,6 +687,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_get_fuse_link_path_with_file() {
+
         // Test with file in package: ./node_modules/lodash/cloneDeep.js -> ./node_modules/lodash/fuse.link
         let path = Path::new("./node_modules/lodash/cloneDeep.js");
         let result = get_fuse_link_path(path);
@@ -746,6 +696,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_get_fuse_link_path_with_subdirectory() {
+
         // Test with subdirectory: ./node_modules/@types/node/fs/promises.d.ts -> ./node_modules/@types/node/fuse.link
         let path = Path::new("/node_modules/@types/node/fs/promises.d.ts");
         let result = get_fuse_link_path(path);
