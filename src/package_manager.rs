@@ -126,9 +126,12 @@ impl PackagePaths {
 pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Result<()> {
     let gz = GzDecoder::new(tgz_bytes);
     let mut archive = Archive::new(gz);
-    let entries = archive
+    let mut entries = archive
         .entries()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // Find the root directory that contains package.json
+    let root_prefix = find_package_root(&mut entries)?;
 
     for entry in entries {
         let mut entry =
@@ -138,12 +141,16 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Resul
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let path_str = path.to_string_lossy().to_string();
 
-        // Remove the first-level "package" directory if present
-        let out_path = if let Some(stripped) = path_str.strip_prefix("package/") {
-            extract_dir.join(stripped)
-        } else if path_str == "package" {
-            // Skip the root package directory
-            continue;
+        // Remove the root prefix if present
+        let out_path = if let Some(prefix) = &root_prefix {
+            if let Some(stripped) = path_str.strip_prefix(&format!("{}/", prefix)) {
+                extract_dir.join(stripped)
+            } else if path_str == *prefix {
+                // Skip the root directory itself
+                continue;
+            } else {
+                extract_dir.join(path_str)
+            }
         } else {
             extract_dir.join(path_str)
         };
@@ -158,6 +165,31 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Resul
         }
     }
     Ok(())
+}
+
+/// Find the root directory that contains package.json
+fn find_package_root(entries: &mut tar::Entries<GzDecoder<&[u8]>>) -> Result<Option<String>> {
+    for entry in entries {
+        let entry = entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let path = entry
+            .path()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let path_str = path.to_string_lossy().to_string();
+
+        // Check if this is a package.json file
+        if path_str.ends_with("/package.json") || path_str == "package.json" {
+            // Extract the root directory
+            if let Some(root_dir) = path_str.strip_suffix("/package.json") {
+                return Ok(Some(root_dir.to_string()));
+            } else {
+                // package.json is at the root level
+                return Ok(None);
+            }
+        }
+    }
+
+    // Fallback: if no package.json found, assume "package" prefix
+    Ok(Some("package".to_string()))
 }
 
 /// Write bytes to file
@@ -338,6 +370,37 @@ mod tests {
             .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
             .collect();
         assert!(src_file_names.contains(&"main.js".to_string()));
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_extract_tgz_bytes_with_custom_root() {
+
+        let extract_dir = PathBuf::from("/test-extract-custom-root");
+        tokio_fs_ext::create_dir_all(&extract_dir).await.unwrap();
+
+        // Create a tar.gz with custom root directory (like @types/react)
+        let tgz_bytes = create_test_tgz_with_custom_root();
+
+        let result = extract_tgz_bytes(&tgz_bytes, &extract_dir).await;
+        assert!(result.is_ok());
+
+        // Verify files were extracted without the custom root prefix
+        let entries = crate::read_dir(&extract_dir).await.unwrap();
+        let file_names: Vec<String> = entries
+            .iter()
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .collect();
+
+        assert!(file_names.contains(&"package.json".to_string()));
+        assert!(file_names.contains(&"index.d.ts".to_string()));
+        assert!(!file_names.contains(&"react".to_string()));
+
+        // Verify package.json content
+        let package_json_content = crate::read(&format!("{}/package.json", extract_dir.to_string_lossy()))
+            .await
+            .unwrap();
+        let package_json_str = String::from_utf8(package_json_content).unwrap();
+        assert!(package_json_str.contains("@types/react"));
     }
 
     #[wasm_bindgen_test]
@@ -738,6 +801,39 @@ mod tests {
             header.set_size(main_js.len() as u64);
             header.set_cksum();
             archive.append(&header, main_js.as_bytes()).unwrap();
+        }
+
+        // Compress with gzip
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Helper function to create test tar.gz bytes with custom root directory (like @types/react)
+    fn create_test_tgz_with_custom_root() -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let mut tar_data = Vec::new();
+        {
+            let mut archive = tar::Builder::new(&mut tar_data);
+
+            // Add package.json with react/ prefix (simulating @types/react structure)
+            let package_json = r#"{"name":"@types/react","version":"18.0.0","types":"index.d.ts"}"#;
+            let mut header = tar::Header::new_gnu();
+            header.set_path("react/package.json").unwrap();
+            header.set_size(package_json.len() as u64);
+            header.set_cksum();
+            archive.append(&header, package_json.as_bytes()).unwrap();
+
+            // Add index.d.ts with react/ prefix
+            let index_dts = "declare module 'react' { export = React; }";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("react/index.d.ts").unwrap();
+            header.set_size(index_dts.len() as u64);
+            header.set_cksum();
+            archive.append(&header, index_dts.as_bytes()).unwrap();
         }
 
         // Compress with gzip
