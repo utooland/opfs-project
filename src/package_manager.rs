@@ -126,12 +126,12 @@ impl PackagePaths {
 pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Result<()> {
     let gz = GzDecoder::new(tgz_bytes);
     let mut archive = Archive::new(gz);
-    let mut entries = archive
+    let entries = archive
         .entries()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    // Find the root directory that contains package.json
-    let root_prefix = find_package_root(&mut entries)?;
+    let mut root_prefix = None;
+    let mut found_package_json = false;
 
     for entry in entries {
         let mut entry =
@@ -140,6 +140,18 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Resul
             .path()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let path_str = path.to_string_lossy().to_string();
+
+        // Find the root directory that contains package.json (only once)
+        if !found_package_json {
+            if path_str.ends_with("/package.json") || path_str == "package.json" {
+                if let Some(root_dir) = path_str.strip_suffix("/package.json") {
+                    root_prefix = Some(root_dir.to_string());
+                } else {
+                    root_prefix = None; // package.json is at the root level
+                }
+                found_package_json = true;
+            }
+        }
 
         // Remove the root prefix if present
         let out_path = if let Some(prefix) = &root_prefix {
@@ -164,32 +176,52 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Resul
             save_tgz(&out_path, &contents).await?;
         }
     }
+
+    // If no package.json found, use "package" as fallback
+    if !found_package_json {
+        // Re-extract with "package" prefix assumption
+        return extract_with_prefix(tgz_bytes, extract_dir, "package").await;
+    }
+
     Ok(())
 }
 
-/// Find the root directory that contains package.json
-fn find_package_root(entries: &mut tar::Entries<GzDecoder<&[u8]>>) -> Result<Option<String>> {
+/// Extract with a specific prefix (fallback method)
+async fn extract_with_prefix(tgz_bytes: &[u8], extract_dir: &PathBuf, prefix: &str) -> Result<()> {
+    let gz = GzDecoder::new(tgz_bytes);
+    let mut archive = Archive::new(gz);
+    let entries = archive
+        .entries()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
     for entry in entries {
-        let entry = entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut entry =
+            entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let path = entry
             .path()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let path_str = path.to_string_lossy().to_string();
 
-        // Check if this is a package.json file
-        if path_str.ends_with("/package.json") || path_str == "package.json" {
-            // Extract the root directory
-            if let Some(root_dir) = path_str.strip_suffix("/package.json") {
-                return Ok(Some(root_dir.to_string()));
-            } else {
-                // package.json is at the root level
-                return Ok(None);
-            }
+        // Remove the prefix if present
+        let out_path = if let Some(stripped) = path_str.strip_prefix(&format!("{}/", prefix)) {
+            extract_dir.join(stripped)
+        } else if path_str == prefix {
+            // Skip the root directory itself
+            continue;
+        } else {
+            extract_dir.join(path_str)
+        };
+
+        if entry.header().entry_type().is_file() {
+            let mut contents = Vec::new();
+            entry
+                .read_to_end(&mut contents)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            // Write the file to the output path
+            save_tgz(&out_path, &contents).await?;
         }
     }
-
-    // Fallback: if no package.json found, assume "package" prefix
-    Ok(Some("package".to_string()))
+    Ok(())
 }
 
 /// Write bytes to file
