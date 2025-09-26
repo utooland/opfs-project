@@ -122,6 +122,20 @@ impl PackagePaths {
     }
 }
 
+/// Archive entry information
+#[derive(Debug)]
+struct ArchiveEntry {
+    path: String,
+    is_file: bool,
+    contents: Option<Vec<u8>>,
+}
+
+impl ArchiveEntry {
+    fn new(path: String, is_file: bool, contents: Option<Vec<u8>>) -> Self {
+        Self { path, is_file, contents }
+    }
+}
+
 /// Extract tgz bytes to directory
 pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Result<()> {
     let gz = GzDecoder::new(tgz_bytes);
@@ -130,68 +144,106 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Resul
         .entries()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    // First pass: collect all entry paths to determine the structure
+    // Collect all archive entries with their contents
     let mut archive_entries = Vec::new();
-    let mut temp_entries = Vec::new();
 
     for entry in entries {
         let mut entry = entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let path = entry.path().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let path_str = path.to_string_lossy().to_string();
-        archive_entries.push(path_str.clone());
+        let is_file = entry.header().entry_type().is_file();
 
-        // Read file contents immediately to avoid consuming the entry twice
-        let mut contents = Vec::new();
-        if entry.header().entry_type().is_file() {
+        let contents = if is_file {
+            let mut file_contents = Vec::new();
             entry
-                .read_to_end(&mut contents)
+                .read_to_end(&mut file_contents)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        }
-        temp_entries.push((path_str, contents));
-    }
-
-    // Determine the root prefix by finding the directory that contains package.json
-    let mut root_prefix = None;
-    for entry in &archive_entries {
-        if entry.ends_with("/package.json") {
-            if let Some(prefix) = entry.strip_suffix("/package.json") {
-                root_prefix = Some(prefix.to_string());
-                break;
-            }
-        } else if entry == "package.json" {
-            // package.json is at root level
-            root_prefix = None;
-            break;
-        }
-    }
-
-    // If no package.json found, fallback to "package" prefix
-    if root_prefix.is_none() && archive_entries.iter().any(|entry| entry.starts_with("package/")) {
-        root_prefix = Some("package".to_string());
-    }
-
-    // Second pass: extract files
-    for (path_str, contents) in temp_entries {
-        let out_path = if let Some(prefix) = &root_prefix {
-            // Strip the root prefix
-            if let Some(stripped) = path_str.strip_prefix(&format!("{}/", prefix)) {
-                extract_dir.join(stripped)
-            } else if path_str == *prefix {
-                // Skip the root directory itself
-                continue;
-            } else {
-                extract_dir.join(path_str)
-            }
+            Some(file_contents)
         } else {
-            // No prefix to strip, use path as-is
-            extract_dir.join(path_str)
+            None
         };
 
-        save_tgz(&out_path, &contents).await?;
+        archive_entries.push(ArchiveEntry::new(path_str, is_file, contents));
+    }
 
+    // Determine the root prefix
+    let root_prefix = determine_root_prefix(&archive_entries);
+
+    // Extract files with proper path handling
+    extract_entries(&archive_entries, extract_dir, &root_prefix).await?;
+
+    Ok(())
+}
+
+
+/// Determine the root prefix by finding package.json location
+fn determine_root_prefix(entries: &[ArchiveEntry]) -> Option<String> {
+    // Look for package.json to determine the root directory
+    for entry in entries {
+        if entry.path.ends_with("/package.json") {
+            if let Some(prefix) = entry.path.strip_suffix("/package.json") {
+                return Some(prefix.to_string());
+            }
+        } else if entry.path == "package.json" {
+            // package.json is at root level
+            return None;
+        }
+    }
+
+    // Fallback: if no package.json found but we have "package/" prefix, use it
+    if entries.iter().any(|entry| entry.path.starts_with("package/")) {
+        Some("package".to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract entries to the target directory
+async fn extract_entries(
+    entries: &[ArchiveEntry],
+    extract_dir: &PathBuf,
+    root_prefix: &Option<String>
+) -> Result<()> {
+    for entry in entries {
+        if !entry.is_file {
+            continue; // Skip non-file entries
+        }
+
+        let out_path = calculate_output_path(&entry.path, extract_dir, root_prefix)?;
+
+        if let Some(contents) = &entry.contents {
+            save_tgz(&out_path, contents).await?;
+        }
     }
 
     Ok(())
+}
+
+/// Calculate the output path for an entry
+fn calculate_output_path(
+    entry_path: &str,
+    extract_dir: &PathBuf,
+    root_prefix: &Option<String>
+) -> Result<PathBuf> {
+    let out_path = if let Some(prefix) = root_prefix {
+        // Strip the root prefix
+        if let Some(stripped) = entry_path.strip_prefix(&format!("{}/", prefix)) {
+            extract_dir.join(stripped)
+        } else if entry_path == prefix {
+            // Skip the root directory itself
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Skipping root directory"
+            ));
+        } else {
+            extract_dir.join(entry_path)
+        }
+    } else {
+        // No prefix to strip, use path as-is
+        extract_dir.join(entry_path)
+    };
+
+    Ok(out_path)
 }
 
 /// Write bytes to file
