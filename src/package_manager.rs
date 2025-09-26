@@ -209,32 +209,31 @@ async fn extract_entries(
             continue; // Skip non-file entries
         }
 
-        let out_path = calculate_output_path(&entry.path, extract_dir, root_prefix)?;
-
-        if let Some(contents) = &entry.contents {
-            save_tgz(&out_path, contents).await?;
+        if let Some(out_path) = calculate_output_path(&entry.path, extract_dir, root_prefix)? {
+            if let Some(contents) = &entry.contents {
+                save_tgz(&out_path, contents).await?;
+            }
         }
+        // If calculate_output_path returns None, skip this entry
     }
 
     Ok(())
 }
 
 /// Calculate the output path for an entry
+/// Returns Ok(None) for entries that should be skipped, Ok(Some(path)) for entries to extract
 fn calculate_output_path(
     entry_path: &str,
     extract_dir: &PathBuf,
     root_prefix: &Option<String>
-) -> Result<PathBuf> {
+) -> Result<Option<PathBuf>> {
     let out_path = if let Some(prefix) = root_prefix {
         // Strip the root prefix
         if let Some(stripped) = entry_path.strip_prefix(&format!("{}/", prefix)) {
             extract_dir.join(stripped)
         } else if entry_path == prefix {
             // Skip the root directory itself
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Skipping root directory"
-            ));
+            return Ok(None);
         } else {
             extract_dir.join(entry_path)
         }
@@ -243,7 +242,7 @@ fn calculate_output_path(
         extract_dir.join(entry_path)
     };
 
-    Ok(out_path)
+    Ok(Some(out_path))
 }
 
 /// Write bytes to file
@@ -610,6 +609,33 @@ mod tests {
             assert!(package_json_str.contains("@types/react"));
             assert!(package_json_str.contains("18.0.0"));
         }
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_calculate_output_path_skips_root_directory() {
+        use std::path::PathBuf;
+
+        let extract_dir = PathBuf::from("/test");
+        let root_prefix = Some("package".to_string());
+
+        // Test that root directory is skipped
+        let result = calculate_output_path("package", &extract_dir, &root_prefix);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "Root directory should be skipped");
+
+        // Test that files under root are not skipped
+        let result = calculate_output_path("package/file.txt", &extract_dir, &root_prefix);
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert!(path.is_some());
+        assert_eq!(path.unwrap(), PathBuf::from("/test/file.txt"));
+
+        // Test that files without prefix are not skipped
+        let result = calculate_output_path("file.txt", &extract_dir, &None);
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert!(path.is_some());
+        assert_eq!(path.unwrap(), PathBuf::from("/test/file.txt"));
     }
 
     #[wasm_bindgen_test]
