@@ -122,6 +122,20 @@ impl PackagePaths {
     }
 }
 
+/// Archive entry information
+#[derive(Debug)]
+struct ArchiveEntry {
+    path: String,
+    is_file: bool,
+    contents: Option<Vec<u8>>,
+}
+
+impl ArchiveEntry {
+    fn new(path: String, is_file: bool, contents: Option<Vec<u8>>) -> Self {
+        Self { path, is_file, contents }
+    }
+}
+
 /// Extract tgz bytes to directory
 pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Result<()> {
     let gz = GzDecoder::new(tgz_bytes);
@@ -130,34 +144,105 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Resul
         .entries()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    for entry in entries {
-        let mut entry =
-            entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let path = entry
-            .path()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let path_str = path.to_string_lossy().to_string();
+    // Collect all archive entries with their contents
+    let mut archive_entries = Vec::new();
 
-        // Remove the first-level "package" directory if present
-        let out_path = if let Some(stripped) = path_str.strip_prefix("package/") {
-            extract_dir.join(stripped)
-        } else if path_str == "package" {
-            // Skip the root package directory
-            continue;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let path = entry.path().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let path_str = path.to_string_lossy().to_string();
+        let is_file = entry.header().entry_type().is_file();
+
+        let contents = if is_file {
+            let mut file_contents = Vec::new();
+            entry
+                .read_to_end(&mut file_contents)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            Some(file_contents)
         } else {
-            extract_dir.join(path_str)
+            None
         };
 
-        if entry.header().entry_type().is_file() {
-            let mut contents = Vec::new();
-            entry
-                .read_to_end(&mut contents)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            // Write the file to the output path
-            save_tgz(&out_path, &contents).await?;
+        archive_entries.push(ArchiveEntry::new(path_str, is_file, contents));
+    }
+
+    // Determine the root prefix
+    let root_prefix = determine_root_prefix(&archive_entries);
+
+    // Extract files with proper path handling
+    extract_entries(&archive_entries, extract_dir, &root_prefix).await?;
+
+    Ok(())
+}
+
+
+/// Determine the root prefix by finding package.json location
+fn determine_root_prefix(entries: &[ArchiveEntry]) -> Option<String> {
+    // Look for package.json to determine the root directory
+    for entry in entries {
+        if entry.path.ends_with("/package.json") {
+            if let Some(prefix) = entry.path.strip_suffix("/package.json") {
+                return Some(prefix.to_string());
+            }
+        } else if entry.path == "package.json" {
+            // package.json is at root level
+            return None;
         }
     }
+
+    // Fallback: if no package.json found but we have "package/" prefix, use it
+    if entries.iter().any(|entry| entry.path.starts_with("package/")) {
+        Some("package".to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract entries to the target directory
+async fn extract_entries(
+    entries: &[ArchiveEntry],
+    extract_dir: &PathBuf,
+    root_prefix: &Option<String>
+) -> Result<()> {
+    for entry in entries {
+        if !entry.is_file {
+            continue; // Skip non-file entries
+        }
+
+        if let Some(out_path) = calculate_output_path(&entry.path, extract_dir, root_prefix)? {
+            if let Some(contents) = &entry.contents {
+                save_tgz(&out_path, contents).await?;
+            }
+        }
+        // If calculate_output_path returns None, skip this entry
+    }
+
     Ok(())
+}
+
+/// Calculate the output path for an entry
+/// Returns Ok(None) for entries that should be skipped, Ok(Some(path)) for entries to extract
+fn calculate_output_path(
+    entry_path: &str,
+    extract_dir: &PathBuf,
+    root_prefix: &Option<String>
+) -> Result<Option<PathBuf>> {
+    let out_path = if let Some(prefix) = root_prefix {
+        // Strip the root prefix
+        if let Some(stripped) = entry_path.strip_prefix(&format!("{}/", prefix)) {
+            extract_dir.join(stripped)
+        } else if entry_path == prefix {
+            // Skip the root directory itself
+            return Ok(None);
+        } else {
+            extract_dir.join(entry_path)
+        }
+    } else {
+        // No prefix to strip, use path as-is
+        extract_dir.join(entry_path)
+    };
+
+    Ok(Some(out_path))
 }
 
 /// Write bytes to file
@@ -186,6 +271,7 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
 mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
     use super::*;
+    use crate::test_utils;
     use crate::{package_lock::{LockPackage, PackageLock}, set_cwd};
 
     use wasm_bindgen_test::*;
@@ -493,6 +579,63 @@ mod tests {
 
         let results = results.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_install_types_react_package() {
+        test_utils::init_tracing();
+
+        // Test installing real @types/react package
+        let result = install_package(
+            "@types/react",
+            "18.0.0",
+            &Some("https://registry.npmjs.org/@types/react/-/react-18.0.0.tgz".to_string()),
+            "node_modules/@types/react",
+        )
+        .await;
+
+        // Should contain success message or error message
+        assert!(result.contains("@types/react@18.0.0"));
+
+        // If installation was successful, verify the package structure
+        if result.contains("installed successfully") {
+            // Check that index.d.ts exists (main type definition file)
+            let index_dts_exists = crate::read("node_modules/@types/react/index.d.ts").await.is_ok();
+            assert!(index_dts_exists, "index.d.ts should exist in @types/react");
+
+            // Verify package.json content
+            let package_json_content = crate::read("node_modules/@types/react/package.json").await.unwrap();
+            let package_json_str = String::from_utf8(package_json_content).unwrap();
+            assert!(package_json_str.contains("@types/react"));
+            assert!(package_json_str.contains("18.0.0"));
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_calculate_output_path_skips_root_directory() {
+        use std::path::PathBuf;
+
+        let extract_dir = PathBuf::from("/test");
+        let root_prefix = Some("package".to_string());
+
+        // Test that root directory is skipped
+        let result = calculate_output_path("package", &extract_dir, &root_prefix);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "Root directory should be skipped");
+
+        // Test that files under root are not skipped
+        let result = calculate_output_path("package/file.txt", &extract_dir, &root_prefix);
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert!(path.is_some());
+        assert_eq!(path.unwrap(), PathBuf::from("/test/file.txt"));
+
+        // Test that files without prefix are not skipped
+        let result = calculate_output_path("file.txt", &extract_dir, &None);
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert!(path.is_some());
+        assert_eq!(path.unwrap(), PathBuf::from("/test/file.txt"));
     }
 
     #[wasm_bindgen_test]
