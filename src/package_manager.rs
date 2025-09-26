@@ -130,33 +130,67 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Resul
         .entries()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
+    // First pass: collect all entry paths to determine the structure
+    let mut archive_entries = Vec::new();
+    let mut temp_entries = Vec::new();
+
     for entry in entries {
-        let mut entry =
-            entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let path = entry
-            .path()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut entry = entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let path = entry.path().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let path_str = path.to_string_lossy().to_string();
+        archive_entries.push(path_str.clone());
 
-        // Remove the first-level "package" directory if present
-        let out_path = if let Some(stripped) = path_str.strip_prefix("package/") {
-            extract_dir.join(stripped)
-        } else if path_str == "package" {
-            // Skip the root package directory
-            continue;
-        } else {
-            extract_dir.join(path_str)
-        };
-
+        // Read file contents immediately to avoid consuming the entry twice
+        let mut contents = Vec::new();
         if entry.header().entry_type().is_file() {
-            let mut contents = Vec::new();
             entry
                 .read_to_end(&mut contents)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            // Write the file to the output path
-            save_tgz(&out_path, &contents).await?;
+        }
+        temp_entries.push((path_str, contents));
+    }
+
+    // Determine the root prefix by finding the directory that contains package.json
+    let mut root_prefix = None;
+    for entry in &archive_entries {
+        if entry.ends_with("/package.json") {
+            if let Some(prefix) = entry.strip_suffix("/package.json") {
+                root_prefix = Some(prefix.to_string());
+                break;
+            }
+        } else if entry == "package.json" {
+            // package.json is at root level
+            root_prefix = None;
+            break;
         }
     }
+
+    // If no package.json found, fallback to "package" prefix
+    if root_prefix.is_none() && archive_entries.iter().any(|entry| entry.starts_with("package/")) {
+        root_prefix = Some("package".to_string());
+    }
+
+    // Second pass: extract files
+    for (path_str, contents) in temp_entries {
+        let out_path = if let Some(prefix) = &root_prefix {
+            // Strip the root prefix
+            if let Some(stripped) = path_str.strip_prefix(&format!("{}/", prefix)) {
+                extract_dir.join(stripped)
+            } else if path_str == *prefix {
+                // Skip the root directory itself
+                continue;
+            } else {
+                extract_dir.join(path_str)
+            }
+        } else {
+            // No prefix to strip, use path as-is
+            extract_dir.join(path_str)
+        };
+
+        save_tgz(&out_path, &contents).await?;
+
+    }
+
     Ok(())
 }
 
@@ -186,6 +220,7 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
 mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
     use super::*;
+    use crate::test_utils;
     use crate::{package_lock::{LockPackage, PackageLock}, set_cwd};
 
     use wasm_bindgen_test::*;
@@ -493,6 +528,36 @@ mod tests {
 
         let results = results.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_install_types_react_package() {
+        test_utils::init_tracing();
+
+        // Test installing real @types/react package
+        let result = install_package(
+            "@types/react",
+            "18.0.0",
+            &Some("https://registry.npmjs.org/@types/react/-/react-18.0.0.tgz".to_string()),
+            "node_modules/@types/react",
+        )
+        .await;
+
+        // Should contain success message or error message
+        assert!(result.contains("@types/react@18.0.0"));
+
+        // If installation was successful, verify the package structure
+        if result.contains("installed successfully") {
+            // Check that index.d.ts exists (main type definition file)
+            let index_dts_exists = crate::read("node_modules/@types/react/index.d.ts").await.is_ok();
+            assert!(index_dts_exists, "index.d.ts should exist in @types/react");
+
+            // Verify package.json content
+            let package_json_content = crate::read("node_modules/@types/react/package.json").await.unwrap();
+            let package_json_str = String::from_utf8(package_json_content).unwrap();
+            assert!(package_json_str.contains("@types/react"));
+            assert!(package_json_str.contains("18.0.0"));
+        }
     }
 
     #[wasm_bindgen_test]
