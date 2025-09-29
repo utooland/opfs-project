@@ -4,6 +4,7 @@ use std::io::Read;
 use std::io::Result;
 use std::path::PathBuf;
 use tar::Archive;
+use tracing::info;
 
 use super::fuse;
 
@@ -168,6 +169,7 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Resul
 
     // Determine the root prefix
     let root_prefix = determine_root_prefix(&archive_entries);
+    info!("Root prefix: {:?}", root_prefix);
 
     // Extract files with proper path handling
     extract_entries(&archive_entries, extract_dir, &root_prefix).await?;
@@ -178,15 +180,30 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Resul
 
 /// Determine the root prefix by finding package.json location
 fn determine_root_prefix(entries: &[ArchiveEntry]) -> Option<String> {
-    // Look for package.json to determine the root directory
-    for entry in entries {
+    // First, check for the most common case: package/package.json
+    if entries.iter().any(|entry| entry.path == "package/package.json") {
+        return Some("package".to_string());
+    }
+
+    // Check if package.json is at root level
+    if entries.iter().any(|entry| entry.path == "package.json") {
+        return None;
+    }
+
+    // Sort entries by path length to prioritize shorter paths (closer to root)
+    let mut sorted_entries: Vec<_> = entries.iter().collect();
+    sorted_entries.sort_by_key(|entry| entry.path.len());
+
+    // Look for other package.json locations
+    for entry in sorted_entries {
         if entry.path.ends_with("/package.json") {
             if let Some(prefix) = entry.path.strip_suffix("/package.json") {
-                return Some(prefix.to_string());
+                // Only consider this as root if prefix is not empty and doesn't contain slashes
+                // This ensures we get the actual root directory, not a nested one
+                if !prefix.is_empty() && !prefix.contains('/') {
+                    return Some(prefix.to_string());
+                }
             }
-        } else if entry.path == "package.json" {
-            // package.json is at root level
-            return None;
         }
     }
 
@@ -608,6 +625,33 @@ mod tests {
             let package_json_str = String::from_utf8(package_json_content).unwrap();
             assert!(package_json_str.contains("@types/react"));
             assert!(package_json_str.contains("18.0.0"));
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_install_scoped_package() {
+        test_utils::init_tracing();
+
+        // Test installing real @types/react package
+        let result = install_package(
+            "@babel/runtime",
+            "7.28.4",
+            &Some("https://registry.npmjs.org/@babel/runtime/-/runtime-7.28.4.tgz".to_string()),
+            "node_modules/@babel/runtime",
+        )
+        .await;
+
+        // Should contain success message or error message
+        assert!(result.contains("@babel/runtime@7.28.4"));
+
+        // If installation was successful, verify the package structure
+        if result.contains("installed successfully") {
+            // Verify package.json content
+            let package_json_content = crate::read("node_modules/@babel/runtime/package.json").await.unwrap();
+            println!("Package.json content: {:?}", String::from_utf8_lossy(&package_json_content));
+            let package_json_str = String::from_utf8(package_json_content).unwrap();
+            assert!(package_json_str.contains("@babel/runtime"));
+            assert!(package_json_str.contains("7.28.4"));
         }
     }
 
