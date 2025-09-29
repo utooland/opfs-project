@@ -4,7 +4,6 @@ use std::io::Read;
 use std::io::Result;
 use std::path::PathBuf;
 use tar::Archive;
-use tracing::info;
 
 use super::fuse;
 
@@ -169,7 +168,6 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Resul
 
     // Determine the root prefix
     let root_prefix = determine_root_prefix(&archive_entries);
-    debug!("Root prefix: {:?}", root_prefix);
 
     // Extract files with proper path handling
     extract_entries(&archive_entries, extract_dir, &root_prefix).await?;
