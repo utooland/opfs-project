@@ -169,7 +169,7 @@ pub async fn extract_tgz_bytes(tgz_bytes: &[u8], extract_dir: &PathBuf) -> Resul
 
     // Determine the root prefix
     let root_prefix = determine_root_prefix(&archive_entries);
-    info!("Root prefix: {:?}", root_prefix);
+    debug!("Root prefix: {:?}", root_prefix);
 
     // Extract files with proper path handling
     extract_entries(&archive_entries, extract_dir, &root_prefix).await?;
