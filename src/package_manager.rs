@@ -632,7 +632,7 @@ mod tests {
     async fn test_install_scoped_package() {
         test_utils::init_tracing();
 
-        // Test installing real @types/react package
+        // Test installing real @babel/runtime package
         let result = install_package(
             "@babel/runtime",
             "7.28.4",
