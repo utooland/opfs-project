@@ -21,7 +21,7 @@ A Rust library for working with the Origin Private File System (OPFS) in WebAsse
 1. Install Rust and Cargo
 2. Install wasm-pack: `cargo install wasm-pack`
 3. Build the project: `wasm-pack build`
-4. Run tests: `wasm-pack test --firefox --headless`
+4. Run tests: `wasm-pack test --chrome --headless`
 
 ## API
 
@@ -49,7 +49,7 @@ A Rust library for working with the Origin Private File System (OPFS) in WebAsse
 Tests are written using wasm-bindgen-test and can be run with:
 
 ```bash
-wasm-pack test --firefox --headless
+wasm-pack test --chrome --headless
 ```
 
 Note: Tests require a modern browser with OPFS support (Firefox 116+, Chrome 114+).
