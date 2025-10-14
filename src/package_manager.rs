@@ -73,10 +73,11 @@ async fn install_package(
                 }
             } else {
                 // Clean up dirty cache if unpacked_dir exists but no marker file
-                if let Ok(metadata) = tokio_fs_ext::metadata(&paths.unpacked_dir).await {
-                    if metadata.is_dir() {
-                        let _ = tokio_fs_ext::remove_dir_all(&paths.unpacked_dir).await;
-                    }
+                if let Ok(metadata) = tokio_fs_ext::metadata(&paths.unpacked_dir).await
+                    && metadata.is_dir()
+                    && let Err(e) = tokio_fs_ext::remove_dir_all(&paths.unpacked_dir).await
+                {
+                    return format!("{name}@{version}: failed to clean up dirty cache: {e}");
                 }
 
                 // Get or download tgz bytes
