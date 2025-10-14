@@ -64,22 +64,37 @@ async fn install_package(
         Some(url) => {
             let paths = PackagePaths::new(name, url, path_key);
 
-            // Check if already unpacked
-            if tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_ok() {
+            // Check if already unpacked by checking for resolved marker file
+            if tokio_fs_ext::metadata(&paths.resolved_marker).await.is_ok() {
+                // Package is fully unpacked, create fuse link
                 match fuse::fuse_link(&paths.unpacked_dir, &paths.link_target_dir).await {
                     Ok(_) => format!("{name}@{version}: installed successfully"),
                     Err(e) => format!("{name}@{version}: {e}"),
                 }
             } else {
+                // Clean up dirty cache if unpacked_dir exists but no marker file
+                if let Ok(metadata) = tokio_fs_ext::metadata(&paths.unpacked_dir).await
+                    && metadata.is_dir()
+                    && let Err(e) = tokio_fs_ext::remove_dir_all(&paths.unpacked_dir).await
+                {
+                    return format!("{name}@{version}: failed to clean up dirty cache: {e}");
+                }
+
                 // Get or download tgz bytes
                 match get_or_download_tgz(url, &paths.tgz_store_path).await {
                     Ok(tgz_bytes) => {
                         // Extract and create fuse link
                         match extract_tgz_bytes(&tgz_bytes, &paths.unpacked_dir).await {
-                            Ok(_) => match fuse::fuse_link(&paths.unpacked_dir, &paths.link_target_dir).await {
-                                Ok(_) => format!("{name}@{version}: installed successfully"),
-                                Err(e) => format!("{name}@{version}: {e}"),
-                            },
+                            Ok(_) => {
+                                // Write resolved marker file to indicate successful extraction
+                                match tokio_fs_ext::write(&paths.resolved_marker, b"").await {
+                                    Ok(_) => match fuse::fuse_link(&paths.unpacked_dir, &paths.link_target_dir).await {
+                                        Ok(_) => format!("{name}@{version}: installed successfully"),
+                                        Err(e) => format!("{name}@{version}: {e}"),
+                                    },
+                                    Err(e) => format!("{name}@{version}: failed to write marker: {e}"),
+                                }
+                            }
                             Err(e) => format!("{name}@{version}: {e}"),
                         }
                     }
@@ -106,6 +121,7 @@ async fn get_or_download_tgz(tgz_url: &str, tgz_store_path: &PathBuf) -> Result<
 struct PackagePaths {
     tgz_store_path: PathBuf,
     unpacked_dir: PathBuf,
+    resolved_marker: PathBuf,
     link_target_dir: PathBuf,
 }
 
@@ -117,6 +133,7 @@ impl PackagePaths {
         Self {
             tgz_store_path: PathBuf::from(format!("/stores/{name}/-/{tgz_file_name}")),
             unpacked_dir: PathBuf::from(format!("/stores/{name}/-/{tgz_file_name}-unpack")),
+            resolved_marker: PathBuf::from(format!("/stores/{name}/-/{tgz_file_name}-unpack._resolved")),
             link_target_dir: PathBuf::from(format!("{path_key}")),
         }
     }
@@ -863,6 +880,83 @@ mod tests {
         // Should contain package content (no node_modules at this level)
         assert!(deep_strict_names.contains(&"package.json".to_string()));
         assert!(!deep_strict_names.contains(&"node_modules".to_string()));
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_dirty_cache_cleanup_and_reinstall() {
+        test_utils::init_tracing();
+
+        // First installation
+        let result = install_package(
+            "test-dirty-cache",
+            "1.0.0",
+            &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+            "node_modules/test-dirty-cache",
+        )
+        .await;
+
+        println!("First install result: {}", result);
+        assert!(result.contains("test-dirty-cache@1.0.0"));
+
+        // If first installation was successful, proceed with dirty cache test
+        if result.contains("installed successfully") {
+            // Verify package.json exists in unpacked directory
+            let paths = PackagePaths::new(
+                "test-dirty-cache",
+                "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                "node_modules/test-dirty-cache",
+            );
+
+            // Check that resolved marker exists
+            let marker_exists = tokio_fs_ext::metadata(&paths.resolved_marker).await.is_ok();
+            assert!(marker_exists, "Resolved marker should exist after first install");
+
+            // Check that package.json exists in unpacked dir
+            let package_json_path = paths.unpacked_dir.join("package.json");
+            let package_json_exists = tokio_fs_ext::metadata(&package_json_path).await.is_ok();
+            assert!(package_json_exists, "package.json should exist in unpacked dir");
+
+            // Simulate dirty cache: delete package.json and _resolved marker
+            println!("Deleting package.json from unpacked dir...");
+            let _ = tokio_fs_ext::remove_file(&package_json_path).await;
+
+            println!("Deleting _resolved marker...");
+            let _ = tokio_fs_ext::remove_file(&paths.resolved_marker).await;
+
+            // Verify they are deleted
+            let marker_deleted = tokio_fs_ext::metadata(&paths.resolved_marker).await.is_err();
+            assert!(marker_deleted, "Resolved marker should be deleted");
+
+            let package_json_deleted = tokio_fs_ext::metadata(&package_json_path).await.is_err();
+            assert!(package_json_deleted, "package.json should be deleted");
+
+            // Second installation - should detect dirty cache and reinstall
+            println!("Running second install...");
+            let result2 = install_package(
+                "test-dirty-cache",
+                "1.0.0",
+                &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+                "node_modules/test-dirty-cache",
+            )
+            .await;
+
+            println!("Second install result: {}", result2);
+            assert!(result2.contains("test-dirty-cache@1.0.0"));
+            assert!(result2.contains("installed successfully"), "Second install should succeed");
+
+            // Verify that package.json is restored in unpacked dir
+            let package_json_restored = tokio_fs_ext::metadata(&package_json_path).await.is_ok();
+            assert!(package_json_restored, "package.json should be restored after reinstall");
+
+            // Verify that _resolved marker is restored
+            let marker_restored = tokio_fs_ext::metadata(&paths.resolved_marker).await.is_ok();
+            assert!(marker_restored, "Resolved marker should be restored after reinstall");
+
+            // Verify package content is correct
+            let package_json_content = crate::read(&package_json_path).await.unwrap();
+            let package_json_str = String::from_utf8(package_json_content).unwrap();
+            assert!(package_json_str.contains("lodash"), "package.json should contain lodash");
+        }
     }
 
     /// Helper function to create test tar.gz bytes
