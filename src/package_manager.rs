@@ -64,22 +64,18 @@ async fn install_package(
         Some(url) => {
             let paths = PackagePaths::new(name, url, path_key);
 
-            // Check if already unpacked by checking for resolved marker file
-            if tokio_fs_ext::metadata(&paths.resolved_marker).await.is_ok() {
+            // Check if already unpacked by checking for both resolved marker and unpacked directory
+            if let Ok(marker_meta) = tokio_fs_ext::metadata(&paths.resolved_marker).await
+                && marker_meta.is_file()
+                && let Ok(dir_meta) = tokio_fs_ext::metadata(&paths.unpacked_dir).await
+                && dir_meta.is_dir()
+            {
                 // Package is fully unpacked, create fuse link
                 match fuse::fuse_link(&paths.unpacked_dir, &paths.link_target_dir).await {
                     Ok(_) => format!("{name}@{version}: installed successfully"),
                     Err(e) => format!("{name}@{version}: {e}"),
                 }
             } else {
-                // Clean up dirty cache if unpacked_dir exists but no marker file
-                if let Ok(metadata) = tokio_fs_ext::metadata(&paths.unpacked_dir).await
-                    && metadata.is_dir()
-                    && let Err(e) = tokio_fs_ext::remove_dir_all(&paths.unpacked_dir).await
-                {
-                    return format!("{name}@{version}: failed to clean up dirty cache: {e}");
-                }
-
                 // Get or download tgz bytes
                 match get_or_download_tgz(url, &paths.tgz_store_path).await {
                     Ok(tgz_bytes) => {
