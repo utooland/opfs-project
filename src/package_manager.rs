@@ -64,22 +64,18 @@ async fn install_package(
         Some(url) => {
             let paths = PackagePaths::new(name, url, path_key);
 
-            // Check if already unpacked by checking for resolved marker file
-            if tokio_fs_ext::metadata(&paths.resolved_marker).await.is_ok() {
+            // Check if already unpacked by checking for both resolved marker and unpacked directory
+            if let Ok(marker_meta) = tokio_fs_ext::metadata(&paths.resolved_marker).await
+                && marker_meta.is_file()
+                && let Ok(dir_meta) = tokio_fs_ext::metadata(&paths.unpacked_dir).await
+                && dir_meta.is_dir()
+            {
                 // Package is fully unpacked, create fuse link
                 match fuse::fuse_link(&paths.unpacked_dir, &paths.link_target_dir).await {
                     Ok(_) => format!("{name}@{version}: installed successfully"),
                     Err(e) => format!("{name}@{version}: {e}"),
                 }
             } else {
-                // Clean up dirty cache if unpacked_dir exists but no marker file
-                if let Ok(metadata) = tokio_fs_ext::metadata(&paths.unpacked_dir).await
-                    && metadata.is_dir()
-                    && let Err(e) = tokio_fs_ext::remove_dir_all(&paths.unpacked_dir).await
-                {
-                    return format!("{name}@{version}: failed to clean up dirty cache: {e}");
-                }
-
                 // Get or download tgz bytes
                 match get_or_download_tgz(url, &paths.tgz_store_path).await {
                     Ok(tgz_bytes) => {
@@ -953,6 +949,156 @@ mod tests {
             assert!(marker_restored, "Resolved marker should be restored after reinstall");
 
             // Verify package content is correct
+            let package_json_content = crate::read(&package_json_path).await.unwrap();
+            let package_json_str = String::from_utf8(package_json_content).unwrap();
+            assert!(package_json_str.contains("lodash"), "package.json should contain lodash");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_marker_exists_but_dir_missing() {
+        test_utils::init_tracing();
+
+        // First installation to create the cache
+        let result = install_package(
+            "test-marker-only",
+            "1.0.0",
+            &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+            "node_modules/test-marker-only",
+        )
+        .await;
+
+        println!("First install result: {}", result);
+
+        // If first installation was successful, proceed with test
+        if result.contains("installed successfully") {
+            let paths = PackagePaths::new(
+                "test-marker-only",
+                "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                "node_modules/test-marker-only",
+            );
+
+            // Verify marker exists
+            let marker_exists = tokio_fs_ext::metadata(&paths.resolved_marker).await.is_ok();
+            assert!(marker_exists, "Marker should exist after first install");
+
+            // Verify unpacked_dir exists
+            let dir_exists = tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_ok();
+            assert!(dir_exists, "Unpacked dir should exist after first install");
+
+            // Simulate scenario: delete unpacked_dir but keep marker
+            println!("Deleting unpacked_dir but keeping marker...");
+            let _ = tokio_fs_ext::remove_dir_all(&paths.unpacked_dir).await;
+
+            // Verify unpacked_dir is deleted
+            let dir_deleted = tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_err();
+            assert!(dir_deleted, "Unpacked dir should be deleted");
+
+            // Verify marker still exists
+            let marker_still_exists = tokio_fs_ext::metadata(&paths.resolved_marker).await.is_ok();
+            assert!(marker_still_exists, "Marker should still exist");
+
+            // Second installation - should detect incomplete cache and reinstall
+            println!("Running second install with marker-only state...");
+            let result2 = install_package(
+                "test-marker-only",
+                "1.0.0",
+                &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+                "node_modules/test-marker-only",
+            )
+            .await;
+
+            println!("Second install result: {}", result2);
+            assert!(result2.contains("test-marker-only@1.0.0"));
+            assert!(
+                result2.contains("installed successfully"),
+                "Second install should succeed and recreate unpacked_dir"
+            );
+
+            // Verify both marker and unpacked_dir exist after reinstall
+            let marker_exists = tokio_fs_ext::metadata(&paths.resolved_marker).await.is_ok();
+            assert!(marker_exists, "Marker should exist after reinstall");
+
+            let dir_exists = tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_ok();
+            assert!(dir_exists, "Unpacked dir should exist after reinstall");
+
+            // Verify package content is correct
+            let package_json_path = paths.unpacked_dir.join("package.json");
+            let package_json_content = crate::read(&package_json_path).await.unwrap();
+            let package_json_str = String::from_utf8(package_json_content).unwrap();
+            assert!(package_json_str.contains("lodash"), "package.json should contain lodash");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_dir_exists_but_marker_missing() {
+        test_utils::init_tracing();
+
+        // First installation to create the cache
+        let result = install_package(
+            "test-dir-only",
+            "1.0.0",
+            &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+            "node_modules/test-dir-only",
+        )
+        .await;
+
+        println!("First install result: {}", result);
+
+        // If first installation was successful, proceed with test
+        if result.contains("installed successfully") {
+            let paths = PackagePaths::new(
+                "test-dir-only",
+                "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                "node_modules/test-dir-only",
+            );
+
+            // Verify marker exists
+            let marker_exists = tokio_fs_ext::metadata(&paths.resolved_marker).await.is_ok();
+            assert!(marker_exists, "Marker should exist after first install");
+
+            // Verify unpacked_dir exists
+            let dir_exists = tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_ok();
+            assert!(dir_exists, "Unpacked dir should exist after first install");
+
+            // Simulate scenario: delete marker but keep unpacked_dir
+            println!("Deleting marker but keeping unpacked_dir...");
+            let _ = tokio_fs_ext::remove_file(&paths.resolved_marker).await;
+
+            // Verify marker is deleted
+            let marker_deleted = tokio_fs_ext::metadata(&paths.resolved_marker).await.is_err();
+            assert!(marker_deleted, "Marker should be deleted");
+
+            // Verify unpacked_dir still exists
+            let dir_still_exists = tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_ok();
+            assert!(dir_still_exists, "Unpacked dir should still exist");
+
+            // Second installation - should detect incomplete cache and reinstall (overwrite)
+            println!("Running second install with dir-only state...");
+            let result2 = install_package(
+                "test-dir-only",
+                "1.0.0",
+                &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+                "node_modules/test-dir-only",
+            )
+            .await;
+
+            println!("Second install result: {}", result2);
+            assert!(result2.contains("test-dir-only@1.0.0"));
+            assert!(
+                result2.contains("installed successfully"),
+                "Second install should succeed and recreate marker"
+            );
+
+            // Verify both marker and unpacked_dir exist after reinstall
+            let marker_exists = tokio_fs_ext::metadata(&paths.resolved_marker).await.is_ok();
+            assert!(marker_exists, "Marker should exist after reinstall");
+
+            let dir_exists = tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_ok();
+            assert!(dir_exists, "Unpacked dir should exist after reinstall");
+
+            // Verify package content is correct (files should be overwritten)
+            let package_json_path = paths.unpacked_dir.join("package.json");
             let package_json_content = crate::read(&package_json_path).await.unwrap();
             let package_json_str = String::from_utf8(package_json_content).unwrap();
             assert!(package_json_str.contains("lodash"), "package.json should contain lodash");
