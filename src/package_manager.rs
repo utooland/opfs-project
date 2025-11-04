@@ -118,10 +118,10 @@ async fn install_package(
         return Ok(());
     }
 
-    // Get or download tgz bytes
-    let tgz_bytes = get_or_download_tgz(url, &paths.tgz_store_path)
+    // Download tgz bytes
+    let tgz_bytes = download_tgz(url, &paths.tgz_store_path)
         .await
-        .context(format!("{}@{}: failed to get or download package", name, version))?;
+        .context(format!("{}@{}: failed to download package", name, version))?;
 
     // Extract and create fuse link
     extract_tgz_bytes(&tgz_bytes, &paths.unpacked_dir)
@@ -141,16 +141,11 @@ async fn install_package(
     Ok(())
 }
 
-/// Get or download tgz file
-async fn get_or_download_tgz(tgz_url: &str, tgz_store_path: &PathBuf) -> Result<Vec<u8>> {
-    if tokio_fs_ext::metadata(tgz_store_path).await.is_ok() {
-        let bytes = super::util::read_direct(tgz_store_path).await?;
-        Ok(bytes)
-    } else {
-        let bytes = download_bytes(tgz_url).await?;
-        save_tgz(tgz_store_path, &bytes).await?;
-        Ok(bytes)
-    }
+/// Download tgz file and save to store
+async fn download_tgz(tgz_url: &str, tgz_store_path: &PathBuf) -> Result<Vec<u8>> {
+    let bytes = download_bytes(tgz_url).await?;
+    save_tgz(tgz_store_path, &bytes).await?;
+    Ok(bytes)
 }
 
 /// Package paths for installation
