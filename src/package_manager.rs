@@ -12,36 +12,25 @@ use crate::package_lock::PackageLock;
 /// Maximum number of concurrent package downloads
 const MAX_CONCURRENT_DOWNLOADS: usize = 10;
 
-/// Download all tgz packages to OPFS
+/// Initialize node_modules structure from package-lock.json
 pub async fn install_deps(package_lock: &str) -> Result<()> {
     let lock = PackageLock::from_json(package_lock)?;
 
-    // Write package.json to root
+    // Write package.json and create node_modules
     ensure_package_json(&lock).await?;
 
-    // Prepare package info for installation
-    let packages: Vec<_> = lock
-        .packages
-        .iter()
-        .filter(|(path, _)| !path.is_empty())
-        .map(|(path, pkg)| {
-            (
-                pkg.get_name(path),
-                pkg.get_version(),
-                pkg.resolved.clone(),
-                path.clone(),
-            )
-        })
-        .collect();
+    // Create first-level node_modules directories
+    init_first_level_node_modules(&lock).await?;
 
-    // Install packages with concurrency control
-    stream::iter(packages)
-        .map(|(name, version, tgz_url, path_key)| async move {
-            install_package(&name, &version, &tgz_url, &path_key).await
-        })
-        .buffer_unordered(MAX_CONCURRENT_DOWNLOADS)
-        .try_collect::<()>()
-        .await
+    Ok(())
+}
+
+/// No longer creates any directories - everything is virtual
+async fn init_first_level_node_modules(_lock: &PackageLock) -> Result<()> {
+    // Don't create any directories, not even the root node_modules
+    // Everything will be virtual DirEntry objects
+    // If we create the directory, read_dir will read the actual directory instead of our virtual one
+    Ok(())
 }
 
 /// Write root package.json to the project directory

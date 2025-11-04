@@ -87,7 +87,6 @@ fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<std::path::PathBuf> {
         current = parent;
     }
 
-    info!("No fuse.link path found for given path");
     None
 }
 
@@ -189,7 +188,7 @@ pub(super) async fn try_read_through_fuse_link<P: AsRef<Path> + std::fmt::Debug>
             (path, relative)
         },
         None => {
-            info!("No fuse link target found for reading");
+            info!("No fuse link target found for reading: {:?}", prepared_path);
             return Ok(None);
         },
     };

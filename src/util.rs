@@ -1,12 +1,14 @@
 use std::io::Result;
 use std::path::Path;
+use tracing::debug;
 
 /// Prepare path by resolving relative paths against current working directory
 pub fn prepare_path<P: AsRef<Path>>(path: P) -> std::path::PathBuf {
     let path_ref = path.as_ref();
     let path_str = path_ref.to_string_lossy();
+    debug!("Preparing path: {}", path_str);
 
-    if path_str.starts_with('/') {
+    let result = if path_str.starts_with('/') {
         std::path::PathBuf::from(path_str.as_ref())
     } else if path_str.starts_with("./") {
         let cwd = crate::get_cwd();
@@ -14,7 +16,8 @@ pub fn prepare_path<P: AsRef<Path>>(path: P) -> std::path::PathBuf {
     } else {
         let cwd = crate::get_cwd();
         cwd.join(path_ref)
-    }
+    };
+    result
 }
 
 /// Read directory directly without fuse.link logic
