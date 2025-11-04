@@ -45,9 +45,11 @@ pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -
 
         let paths = PackagePaths::new(&name, url, &path_key);
 
-        // Check if already unpacked
-        if tokio_fs_ext::metadata(&paths.resolved_marker).await.is_ok()
-            && tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_ok()
+        // Check if already unpacked (strict check: marker must be file, unpacked_dir must be directory)
+        if let Ok(marker_meta) = tokio_fs_ext::metadata(&paths.resolved_marker).await
+            && marker_meta.is_file()
+            && let Ok(dir_meta) = tokio_fs_ext::metadata(&paths.unpacked_dir).await
+            && dir_meta.is_dir()
         {
             cached_packages.push((paths, name, version));
         } else {
@@ -1323,6 +1325,188 @@ mod tests {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&tar_data).unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_marker_as_directory_not_cached() {
+        test_utils::init_tracing();
+
+        let mut packages = std::collections::HashMap::new();
+
+        // Root package
+        let root_package = LockPackage {
+            name: Some("test-marker-dir".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: None,
+            integrity: None,
+            license: None,
+            dependencies: Some(std::collections::HashMap::new()),
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        };
+        packages.insert("".to_string(), root_package);
+
+        // Test package with valid URL
+        let test_package = LockPackage {
+            name: Some("test-pkg".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+            integrity: Some("sha512-test".to_string()),
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        };
+        packages.insert("node_modules/test-pkg".to_string(), test_package);
+
+        let lock = PackageLock {
+            name: "test-marker-dir".to_string(),
+            version: "1.0.0".to_string(),
+            lockfile_version: 2,
+            requires: true,
+            packages,
+            dependencies: None,
+        };
+
+        // Create paths
+        let paths = PackagePaths::new(
+            "test-pkg",
+            "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+            "node_modules/test-pkg",
+        );
+
+        // Create marker as a DIRECTORY (incorrect state)
+        tokio_fs_ext::create_dir_all(&paths.resolved_marker).await.unwrap();
+
+        // Create unpacked_dir as a proper directory
+        tokio_fs_ext::create_dir_all(&paths.unpacked_dir).await.unwrap();
+
+        let lock_json = serde_json::to_string(&lock).unwrap();
+
+        // This should NOT treat the package as cached because marker is a directory, not a file
+        // It should attempt to download and install
+        let result = install_deps(&lock_json, 10).await;
+
+        // We expect this to either:
+        // 1. Succeed (if network is available) - marker gets replaced with proper file
+        // 2. Fail (if network unavailable or other error)
+        // The key point is that it should NOT skip the package as "cached"
+
+        if result.is_ok() {
+            // If successful, marker should now be a file
+            let marker_meta = tokio_fs_ext::metadata(&paths.resolved_marker).await.unwrap();
+            assert!(marker_meta.is_file(), "marker should be a file after install_deps");
+        } else {
+            println!("Test result: {:?}", result);
+            // Network might be unavailable, which is acceptable for this test
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_unpacked_dir_as_file_not_cached() {
+        test_utils::init_tracing();
+
+        let mut packages = std::collections::HashMap::new();
+
+        // Root package
+        let root_package = LockPackage {
+            name: Some("test-dir-file".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: None,
+            integrity: None,
+            license: None,
+            dependencies: Some(std::collections::HashMap::new()),
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        };
+        packages.insert("".to_string(), root_package);
+
+        // Test package with valid URL
+        let test_package = LockPackage {
+            name: Some("test-pkg2".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+            integrity: Some("sha512-test".to_string()),
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        };
+        packages.insert("node_modules/test-pkg2".to_string(), test_package);
+
+        let lock = PackageLock {
+            name: "test-dir-file".to_string(),
+            version: "1.0.0".to_string(),
+            lockfile_version: 2,
+            requires: true,
+            packages,
+            dependencies: None,
+        };
+
+        // Create paths
+        let paths = PackagePaths::new(
+            "test-pkg2",
+            "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+            "node_modules/test-pkg2",
+        );
+
+        // Create marker as a proper file
+        tokio_fs_ext::create_dir_all(paths.resolved_marker.parent().unwrap()).await.unwrap();
+        tokio_fs_ext::write(&paths.resolved_marker, b"").await.unwrap();
+
+        // Create unpacked_dir as a FILE (incorrect state)
+        tokio_fs_ext::create_dir_all(paths.unpacked_dir.parent().unwrap()).await.unwrap();
+        tokio_fs_ext::write(&paths.unpacked_dir, b"not a directory").await.unwrap();
+
+        let lock_json = serde_json::to_string(&lock).unwrap();
+
+        // This should NOT treat the package as cached because unpacked_dir is a file, not a directory
+        let result = install_deps(&lock_json, 10).await;
+
+        // We expect this to either:
+        // 1. Succeed (if network is available) - unpacked_dir gets replaced with proper directory
+        // 2. Fail (if network unavailable or other error)
+
+        if result.is_ok() {
+            // If successful, unpacked_dir should now be a directory
+            let dir_meta = tokio_fs_ext::metadata(&paths.unpacked_dir).await.unwrap();
+            assert!(dir_meta.is_dir(), "unpacked_dir should be a directory after install_deps");
+        } else {
+            println!("Test result: {:?}", result);
+            // Network might be unavailable, which is acceptable for this test
+        }
     }
 
     #[wasm_bindgen_test]
