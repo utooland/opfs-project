@@ -9,11 +9,8 @@ use super::fuse;
 
 use crate::package_lock::PackageLock;
 
-/// Maximum number of concurrent package downloads
-const MAX_CONCURRENT_DOWNLOADS: usize = 10;
-
 /// Download all tgz packages to OPFS
-pub async fn install_deps(package_lock: &str) -> Result<()> {
+pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -> Result<()> {
     let lock = PackageLock::from_json(package_lock)?;
 
     // Write package.json to root
@@ -34,12 +31,46 @@ pub async fn install_deps(package_lock: &str) -> Result<()> {
         })
         .collect();
 
-    // Install packages with concurrency control
-    stream::iter(packages)
+    // Step 1: Filter packages into cached and needs-download
+    let mut cached_packages = Vec::new();
+    let mut packages_to_download = Vec::new();
+
+    for (name, version, tgz_url, path_key) in packages {
+        let url = match tgz_url.as_ref() {
+            Some(u) => u,
+            None => {
+                return Err(anyhow::anyhow!("{}@{}: no resolved field", name, version));
+            }
+        };
+
+        let paths = PackagePaths::new(&name, url, &path_key);
+
+        // Check if already unpacked
+        if tokio_fs_ext::metadata(&paths.resolved_marker).await.is_ok()
+            && tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_ok()
+        {
+            cached_packages.push((paths, name, version));
+        } else {
+            packages_to_download.push((name, version, tgz_url, path_key));
+        }
+    }
+
+    // Step 2: Create fuse links for cached packages (parallel, no limit)
+    futures::future::try_join_all(
+        cached_packages.into_iter().map(|(paths, name, version)| async move {
+            fuse::fuse_link(&paths.unpacked_dir, &paths.link_target_dir)
+                .await
+                .context(format!("{}@{}: failed to create fuse link", name, version))
+        })
+    )
+    .await?;
+
+    // Step 3: Download and install packages with concurrency control
+    stream::iter(packages_to_download)
         .map(|(name, version, tgz_url, path_key)| async move {
             install_package(&name, &version, &tgz_url, &path_key).await
         })
-        .buffer_unordered(MAX_CONCURRENT_DOWNLOADS)
+        .buffer_unordered(max_concurrent_downloads)
         .try_collect::<()>()
         .await
 }
@@ -558,7 +589,7 @@ mod tests {
         let project_name = PathBuf::from("/test-project-install");
         tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
 
-        let result = install_deps(&lock_json).await;
+        let result = install_deps(&lock_json, 10).await;
 
         // May succeed or fail depending on network availability
         // Just verify it returns a result (not panics)
@@ -572,7 +603,7 @@ mod tests {
 
         let invalid_lock_json = "{ invalid json }";
 
-        let result = install_deps(invalid_lock_json).await;
+        let result = install_deps(invalid_lock_json, 10).await;
         assert!(result.is_err());
     }
 
@@ -617,7 +648,7 @@ mod tests {
 
         let lock_json = serde_json::to_string(&lock).unwrap();
 
-        let result = install_deps(&lock_json).await;
+        let result = install_deps(&lock_json, 10).await;
         assert!(result.is_ok());
     }
 
@@ -803,7 +834,7 @@ mod tests {
         println!("Package lock JSON: {}", lock_json);
 
         // Test the installation
-        let result = install_deps(&lock_json).await;
+        let result = install_deps(&lock_json, 10).await;
 
         // Installation should either succeed or fail with an error
         // (network issues are acceptable in tests)
@@ -1213,7 +1244,7 @@ mod tests {
         let lock_json = serde_json::to_string(&lock).unwrap();
 
         // Should fail because one package has no resolved field
-        let result = install_deps(&lock_json).await;
+        let result = install_deps(&lock_json, 10).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         // The error should contain information about the missing resolved field
