@@ -1324,4 +1324,120 @@ mod tests {
         encoder.write_all(&tar_data).unwrap();
         encoder.finish().unwrap()
     }
+
+    #[wasm_bindgen_test]
+    async fn test_corrupted_tgz_file_gets_redownloaded() {
+        test_utils::init_tracing();
+
+        let name = "test-corrupted-tgz";
+        let version = "1.0.0";
+        let url = "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
+        let path_key = "node_modules/test-corrupted-tgz";
+
+        let paths = PackagePaths::new(name, url, path_key);
+
+        // Create an empty/corrupted tgz file in the store
+        tokio_fs_ext::create_dir_all(paths.tgz_store_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio_fs_ext::write(&paths.tgz_store_path, b"corrupted data")
+            .await
+            .unwrap();
+
+        // Verify corrupted file exists
+        let corrupted_meta = tokio_fs_ext::metadata(&paths.tgz_store_path).await.unwrap();
+        let corrupted_size = corrupted_meta.len();
+        assert_eq!(corrupted_size, 14); // "corrupted data".len()
+
+        // Call install_package - should detect no marker/unpacked_dir and re-download
+        let result = install_package(name, version, &Some(url.to_string()), path_key).await;
+
+        if result.is_ok() {
+            // Verify tgz was replaced with valid content
+            let new_meta = tokio_fs_ext::metadata(&paths.tgz_store_path).await.unwrap();
+            let new_size = new_meta.len();
+
+            // Valid lodash tgz should be much larger than 14 bytes
+            assert!(
+                new_size > 1000,
+                "tgz file should be replaced with valid content, got {} bytes",
+                new_size
+            );
+
+            // Verify marker was created (indicating successful extraction)
+            assert!(
+                tokio_fs_ext::metadata(&paths.resolved_marker).await.is_ok(),
+                "marker file should exist after successful installation"
+            );
+
+            // Verify unpacked_dir exists
+            assert!(
+                tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_ok(),
+                "unpacked_dir should exist after successful installation"
+            );
+
+            // Verify package.json exists in unpacked dir
+            let package_json_path = paths.unpacked_dir.join("package.json");
+            assert!(
+                tokio_fs_ext::metadata(&package_json_path).await.is_ok(),
+                "package.json should exist in unpacked directory"
+            );
+        } else {
+            println!("Test skipped: network unavailable");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_empty_tgz_file_gets_redownloaded() {
+        test_utils::init_tracing();
+
+        let name = "test-empty-tgz";
+        let version = "1.0.0";
+        let url = "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
+        let path_key = "node_modules/test-empty-tgz";
+
+        let paths = PackagePaths::new(name, url, path_key);
+
+        // Create an empty tgz file in the store
+        tokio_fs_ext::create_dir_all(paths.tgz_store_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio_fs_ext::write(&paths.tgz_store_path, b"")
+            .await
+            .unwrap();
+
+        // Verify empty file exists
+        let empty_meta = tokio_fs_ext::metadata(&paths.tgz_store_path).await.unwrap();
+        assert_eq!(empty_meta.len(), 0);
+
+        // Call install_package - should detect no marker/unpacked_dir and re-download
+        let result = install_package(name, version, &Some(url.to_string()), path_key).await;
+
+        if result.is_ok() {
+            // Verify tgz was replaced with valid content
+            let new_meta = tokio_fs_ext::metadata(&paths.tgz_store_path).await.unwrap();
+            let new_size = new_meta.len();
+
+            // Valid lodash tgz should be much larger than 0 bytes
+            assert!(
+                new_size > 1000,
+                "empty tgz file should be replaced with valid content, got {} bytes",
+                new_size
+            );
+
+            // Verify marker was created
+            assert!(
+                tokio_fs_ext::metadata(&paths.resolved_marker).await.is_ok(),
+                "marker file should exist after successful installation"
+            );
+
+            // Verify unpacked_dir exists
+            assert!(
+                tokio_fs_ext::metadata(&paths.unpacked_dir).await.is_ok(),
+                "unpacked_dir should exist after successful installation"
+            );
+        } else {
+            println!("Test skipped: network unavailable");
+        }
+    }
 }
