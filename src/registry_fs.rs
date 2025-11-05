@@ -807,7 +807,11 @@ pub(crate) async fn try_read_dir_through_registry<P: AsRef<Path> + std::fmt::Deb
         }
 
         let entry_path = path_ref.join(name);
-        let file_type = tokio_fs_ext::FileType::from_str(&entry.file_type);
+        let file_type = match entry.file_type.as_str() {
+            "file" => tokio_fs_ext::FileType::File,
+            "directory" => tokio_fs_ext::FileType::Directory,
+            _ => tokio_fs_ext::FileType::File, // fallback to file
+        };
 
         info!("  - Virtual entry: {} (type: {})", name, entry.file_type);
 
