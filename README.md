@@ -36,7 +36,7 @@ A Rust library for working with the Origin Private File System (OPFS) in WebAsse
 
 ### Package Management
 
-- `package_manager::install_deps(package_lock)` - Install dependencies from package-lock.json
+- `package_manager::install_deps(package_lock, max_concurrent_downloads)` - Install dependencies from package-lock.json with specified concurrency limit
 
 ### Fuse Link Operations
 

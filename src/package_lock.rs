@@ -8,6 +8,7 @@ pub struct LockPackage {
     pub version: Option<String>,
     pub resolved: Option<String>,
     pub integrity: Option<String>,
+    pub shasum: Option<String>,
     pub license: Option<String>,
     pub dependencies: Option<HashMap<String, String>>,
     #[serde(rename = "devDependencies")]
