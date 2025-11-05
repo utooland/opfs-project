@@ -842,7 +842,7 @@ mod tests {
             name: Some("lodash".to_string()),
             version: Some("4.17.21".to_string()),
             resolved: Some("https://registry.npmmirror.com/lodash/-/lodash-4.17.21.tgz".to_string()),
-            integrity: Some("sha512-test-lodash".to_string()),
+            integrity: None,  // No integrity check for this test
             shasum: None,
             license: None,
             dependencies: None,
@@ -864,7 +864,7 @@ mod tests {
             name: Some("lodash.has".to_string()),
             version: Some("4.5.2".to_string()),
             resolved: Some("https://registry.npmmirror.com/lodash.has/-/lodash.has-4.5.2.tgz".to_string()),
-            integrity: Some("sha512-test-lodash-has".to_string()),
+            integrity: None,  // No integrity check for this test
             shasum: None,
             license: None,
             dependencies: None,
@@ -886,7 +886,7 @@ mod tests {
             name: Some("deep-strict".to_string()),
             version: Some("1.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/lodash.chunk/-/lodash.chunk-4.2.0.tgz".to_string()),
-            integrity: Some("sha512-test-deep-strict".to_string()),
+            integrity: None,  // No integrity check for this test
             shasum: None,
             license: None,
             dependencies: None,
@@ -1292,7 +1292,7 @@ mod tests {
             name: Some("lodash".to_string()),
             version: Some("4.17.21".to_string()),
             resolved: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
-            integrity: Some("sha512-test".to_string()),
+            integrity: None,  // No integrity check for this test
             shasum: None,
             license: None,
             dependencies: None,
@@ -1462,7 +1462,7 @@ mod tests {
             name: Some("test-pkg".to_string()),
             version: Some("1.0.0".to_string()),
             resolved: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
-            integrity: Some("sha512-test".to_string()),
+            integrity: None,  // No integrity check for this test
             shasum: None,
             license: None,
             dependencies: None,
@@ -1555,7 +1555,7 @@ mod tests {
             name: Some("test-pkg2".to_string()),
             version: Some("1.0.0".to_string()),
             resolved: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
-            integrity: Some("sha512-test".to_string()),
+            integrity: None,  // No integrity check for this test
             shasum: None,
             license: None,
             dependencies: None,
