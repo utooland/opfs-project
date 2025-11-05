@@ -4,6 +4,9 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use std::io::Read;
 use std::path::PathBuf;
 use tar::Archive;
+use sha1::{Sha1, Digest};
+use sha2::Sha512;
+use data_encoding::BASE64;
 
 use super::fuse;
 
@@ -26,6 +29,8 @@ pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -
                 pkg.get_name(path),
                 pkg.get_version(),
                 pkg.resolved.clone(),
+                pkg.integrity.clone(),
+                pkg.shasum.clone(),
                 path.clone(),
             )
         })
@@ -35,7 +40,7 @@ pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -
     let mut cached_packages = Vec::new();
     let mut packages_to_download = Vec::new();
 
-    for (name, version, tgz_url, path_key) in packages {
+    for (name, version, tgz_url, integrity, shasum, path_key) in packages {
         let url = match tgz_url.as_ref() {
             Some(u) => u,
             None => {
@@ -46,14 +51,21 @@ pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -
         let paths = PackagePaths::new(&name, url, &path_key);
 
         // Check if already unpacked (strict check: marker must be file, unpacked_dir must be directory)
-        if let Ok(marker_meta) = tokio_fs_ext::metadata(&paths.resolved_marker).await
+        // If _resolved marker exists, it means the package has been verified and extracted successfully
+        let is_cached = if let Ok(marker_meta) = tokio_fs_ext::metadata(&paths.resolved_marker).await
             && marker_meta.is_file()
             && let Ok(dir_meta) = tokio_fs_ext::metadata(&paths.unpacked_dir).await
             && dir_meta.is_dir()
         {
+            true
+        } else {
+            false
+        };
+
+        if is_cached {
             cached_packages.push((paths, name, version));
         } else {
-            packages_to_download.push((name, version, tgz_url, path_key));
+            packages_to_download.push((name, version, tgz_url, integrity, shasum, path_key));
         }
     }
 
@@ -69,8 +81,8 @@ pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -
 
     // Step 3: Download and install packages with concurrency control
     stream::iter(packages_to_download)
-        .map(|(name, version, tgz_url, path_key)| async move {
-            install_package(&name, &version, &tgz_url, &path_key).await
+        .map(|(name, version, tgz_url, integrity, shasum, path_key)| async move {
+            install_package(&name, &version, &tgz_url, integrity.as_deref(), shasum.as_deref(), &path_key).await
         })
         .buffer_unordered(max_concurrent_downloads)
         .try_collect::<()>()
@@ -99,6 +111,8 @@ async fn install_package(
     name: &str,
     version: &str,
     tgz_url: &Option<String>,
+    integrity: Option<&str>,
+    shasum: Option<&str>,
     path_key: &str,
 ) -> Result<()> {
     let url = tgz_url
@@ -108,20 +122,21 @@ async fn install_package(
     let paths = PackagePaths::new(name, url, path_key);
 
     // Check if already unpacked by checking for both resolved marker and unpacked directory
+    // If _resolved marker exists, it means the package has been verified and extracted successfully
     if let Ok(marker_meta) = tokio_fs_ext::metadata(&paths.resolved_marker).await
         && marker_meta.is_file()
         && let Ok(dir_meta) = tokio_fs_ext::metadata(&paths.unpacked_dir).await
         && dir_meta.is_dir()
     {
-        // Package is fully unpacked, create fuse link
+        // Package is fully unpacked and verified, create fuse link
         fuse::fuse_link(&paths.unpacked_dir, &paths.link_target_dir)
             .await
             .context(format!("{}@{}: failed to create fuse link", name, version))?;
         return Ok(());
     }
 
-    // Download tgz bytes
-    let tgz_bytes = download_tgz(url, &paths.tgz_store_path)
+    // Download and verify tgz bytes
+    let tgz_bytes = download_tgz(url, &paths.tgz_store_path, integrity, shasum)
         .await
         .context(format!("{}@{}: failed to download package", name, version))?;
 
@@ -144,8 +159,38 @@ async fn install_package(
 }
 
 /// Download tgz file and save to store
-async fn download_tgz(tgz_url: &str, tgz_store_path: &PathBuf) -> Result<Vec<u8>> {
+/// If tgz file exists and integrity matches, use cached file instead of downloading
+async fn download_tgz(
+    tgz_url: &str,
+    tgz_store_path: &PathBuf,
+    integrity: Option<&str>,
+    shasum: Option<&str>,
+) -> Result<Vec<u8>> {
+    // Check if tgz file already exists and verify its integrity
+    if let Ok(existing_bytes) = tokio_fs_ext::read(tgz_store_path).await {
+        if integrity.is_some() || shasum.is_some() {
+            // If we have integrity/shasum info, verify the existing file
+            if verify_integrity(&existing_bytes, integrity, shasum) {
+                // Existing file is valid, use it
+                return Ok(existing_bytes);
+            }
+            // Existing file is corrupted or doesn't match, will re-download below
+        }
+    }
+
+    // Download new file
     let bytes = download_bytes(tgz_url).await?;
+
+    // Verify downloaded file if integrity/shasum is provided
+    if integrity.is_some() || shasum.is_some() {
+        if !verify_integrity(&bytes, integrity, shasum) {
+            return Err(anyhow::anyhow!(
+                "Downloaded file integrity check failed for {}",
+                tgz_url
+            ));
+        }
+    }
+
     save_tgz(tgz_store_path, &bytes).await?;
     Ok(bytes)
 }
@@ -335,6 +380,33 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
 
     Ok(bytes.to_vec())
 }
+
+/// Verify file integrity using shasum or integrity field
+/// Returns true if the file matches the expected hash, false otherwise
+fn verify_integrity(file_bytes: &[u8], integrity: Option<&str>, shasum: Option<&str>) -> bool {
+    // Try integrity first (sha512)
+    if let Some(integrity_str) = integrity {
+        if let Some(hash_part) = integrity_str.strip_prefix("sha512-") {
+            let mut hasher = Sha512::new();
+            hasher.update(file_bytes);
+            let result = hasher.finalize();
+            let calculated = BASE64.encode(&result);
+            return calculated == hash_part;
+        }
+    }
+
+    // Fall back to shasum (sha1)
+    if let Some(expected_shasum) = shasum {
+        let mut hasher = Sha1::new();
+        hasher.update(file_bytes);
+        let result = hasher.finalize();
+        let calculated = format!("{:x}", result);
+        return calculated == expected_shasum;
+    }
+
+    // If no hash information is available, we can't verify
+    false
+}
 #[cfg(test)]
 mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -354,6 +426,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             resolved: None,
             integrity: None,
+            shasum: None,
             license: None,
             dependencies: Some(std::collections::HashMap::new()),
             dev_dependencies: None,
@@ -375,6 +448,7 @@ mod tests {
             version: Some("4.17.21".to_string()),
             resolved: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
             integrity: Some("sha512-/2U81OjsGkbyk2+ThmuxvWcDrfj8q+I+evwve1/49eHGH9bLjjPKFmy6Hmyac1Wg4nW/brXyT3dD9zdLv5L8Ug==".to_string()),
+            shasum: Some("fb5dfc0a2ba5a90ee053c813d71f16e6b66ac994".to_string()),
             license: None,
             dependencies: None,
             dev_dependencies: None,
@@ -516,6 +590,8 @@ mod tests {
             "lodash",
             "4.17.21",
             &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+            None,
+            None,
             "node_modules/lodash",
         )
         .await;
@@ -526,7 +602,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_install_package_without_url() {
 
-        let result = install_package("lodash", "4.17.21", &None, "node_modules/lodash").await;
+        let result = install_package("lodash", "4.17.21", &None, None, None, "node_modules/lodash").await;
 
         // Should fail with error about missing resolved field
         assert!(result.is_err());
@@ -628,6 +704,7 @@ mod tests {
                 version: Some("1.0.0".to_string()),
                 resolved: None,
                 integrity: None,
+                shasum: None,
                 license: None,
                 dependencies: Some(std::collections::HashMap::new()),
                 dev_dependencies: None,
@@ -658,6 +735,8 @@ mod tests {
             "@types/react",
             "18.0.0",
             &Some("https://registry.npmjs.org/@types/react/-/react-18.0.0.tgz".to_string()),
+            None,
+            None,
             "node_modules/@types/react",
         )
         .await;
@@ -685,6 +764,8 @@ mod tests {
             "@babel/runtime",
             "7.28.4",
             &Some("https://registry.npmjs.org/@babel/runtime/-/runtime-7.28.4.tgz".to_string()),
+            None,
+            None,
             "node_modules/@babel/runtime",
         )
         .await;
@@ -740,6 +821,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             resolved: None,
             integrity: None,
+            shasum: None,
             license: None,
             dependencies: Some(std::collections::HashMap::new()),
             dev_dependencies: None,
@@ -761,6 +843,7 @@ mod tests {
             version: Some("4.17.21".to_string()),
             resolved: Some("https://registry.npmmirror.com/lodash/-/lodash-4.17.21.tgz".to_string()),
             integrity: Some("sha512-test-lodash".to_string()),
+            shasum: None,
             license: None,
             dependencies: None,
             dev_dependencies: None,
@@ -782,6 +865,7 @@ mod tests {
             version: Some("4.5.2".to_string()),
             resolved: Some("https://registry.npmmirror.com/lodash.has/-/lodash.has-4.5.2.tgz".to_string()),
             integrity: Some("sha512-test-lodash-has".to_string()),
+            shasum: None,
             license: None,
             dependencies: None,
             dev_dependencies: None,
@@ -803,6 +887,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/lodash.chunk/-/lodash.chunk-4.2.0.tgz".to_string()),
             integrity: Some("sha512-test-deep-strict".to_string()),
+            shasum: None,
             license: None,
             dependencies: None,
             dev_dependencies: None,
@@ -906,6 +991,8 @@ mod tests {
             "test-dirty-cache",
             "1.0.0",
             &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+            None,
+            None,
             "node_modules/test-dirty-cache",
         )
         .await;
@@ -950,6 +1037,8 @@ mod tests {
                 "test-dirty-cache",
                 "1.0.0",
                 &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+                None,
+                None,
                 "node_modules/test-dirty-cache",
             )
             .await;
@@ -981,6 +1070,8 @@ mod tests {
             "test-marker-only",
             "1.0.0",
             &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+            None,
+            None,
             "node_modules/test-marker-only",
         )
         .await;
@@ -1021,6 +1112,8 @@ mod tests {
                 "test-marker-only",
                 "1.0.0",
                 &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+                None,
+                None,
                 "node_modules/test-marker-only",
             )
             .await;
@@ -1055,6 +1148,8 @@ mod tests {
             "test-dir-only",
             "1.0.0",
             &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+            None,
+            None,
             "node_modules/test-dir-only",
         )
         .await;
@@ -1095,6 +1190,8 @@ mod tests {
                 "test-dir-only",
                 "1.0.0",
                 &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+                None,
+                None,
                 "node_modules/test-dir-only",
             )
             .await;
@@ -1129,6 +1226,8 @@ mod tests {
             "invalid-package",
             "1.0.0",
             &Some("https://invalid-domain-that-does-not-exist.com/package.tgz".to_string()),
+            None,
+            None,
             "node_modules/invalid-package",
         )
         .await;
@@ -1172,6 +1271,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             resolved: None,
             integrity: None,
+            shasum: None,
             license: None,
             dependencies: Some(std::collections::HashMap::new()),
             dev_dependencies: None,
@@ -1193,6 +1293,7 @@ mod tests {
             version: Some("4.17.21".to_string()),
             resolved: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
             integrity: Some("sha512-test".to_string()),
+            shasum: None,
             license: None,
             dependencies: None,
             dev_dependencies: None,
@@ -1214,6 +1315,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             resolved: None, // This will cause an error
             integrity: None,
+            shasum: None,
             license: None,
             dependencies: None,
             dev_dependencies: None,
@@ -1339,6 +1441,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             resolved: None,
             integrity: None,
+            shasum: None,
             license: None,
             dependencies: Some(std::collections::HashMap::new()),
             dev_dependencies: None,
@@ -1360,6 +1463,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             resolved: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
             integrity: Some("sha512-test".to_string()),
+            shasum: None,
             license: None,
             dependencies: None,
             dev_dependencies: None,
@@ -1430,6 +1534,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             resolved: None,
             integrity: None,
+            shasum: None,
             license: None,
             dependencies: Some(std::collections::HashMap::new()),
             dev_dependencies: None,
@@ -1451,6 +1556,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             resolved: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
             integrity: Some("sha512-test".to_string()),
+            shasum: None,
             license: None,
             dependencies: None,
             dev_dependencies: None,
@@ -1534,7 +1640,7 @@ mod tests {
         assert_eq!(corrupted_size, 14); // "corrupted data".len()
 
         // Call install_package - should detect no marker/unpacked_dir and re-download
-        let result = install_package(name, version, &Some(url.to_string()), path_key).await;
+        let result = install_package(name, version, &Some(url.to_string()), None, None, path_key).await;
 
         if result.is_ok() {
             // Verify tgz was replaced with valid content
@@ -1572,6 +1678,55 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    async fn test_verify_integrity_with_shasum() {
+        // Test data: "hello world"
+        let test_data = b"hello world";
+
+        // SHA1 hash of "hello world" is 2aae6c35c94fcfb415dbe95f408b9ce91ee846ed
+        let expected_shasum = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed";
+
+        // Verify with correct shasum
+        assert!(verify_integrity(test_data, None, Some(expected_shasum)));
+
+        // Verify with incorrect shasum
+        assert!(!verify_integrity(test_data, None, Some("incorrect_hash")));
+
+        // Verify with no hash info
+        assert!(!verify_integrity(test_data, None, None));
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_verify_integrity_with_integrity() {
+        // Test data: "hello world"
+        let test_data = b"hello world";
+
+        // SHA512 hash of "hello world" in base64
+        let expected_integrity = "sha512-MJ7MSJwS1utMxA9QyQLytNDtd+5RGnx6m808qG1M2G+YndNbxf9JlnDaNCVbRbDP2DDoH2Bdz33FVC6TrpzXbw==";
+
+        // Verify with correct integrity
+        assert!(verify_integrity(test_data, Some(expected_integrity), None));
+
+        // Verify with incorrect integrity
+        assert!(!verify_integrity(test_data, Some("sha512-incorrect"), None));
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_verify_integrity_priority() {
+        // Test data: "hello world"
+        let test_data = b"hello world";
+
+        let correct_integrity = "sha512-MJ7MSJwS1utMxA9QyQLytNDtd+5RGnx6m808qG1M2G+YndNbxf9JlnDaNCVbRbDP2DDoH2Bdz33FVC6TrpzXbw==";
+        let correct_shasum = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed";
+
+        // When both are provided, integrity should take priority
+        // If integrity is correct, should return true even if shasum is wrong
+        assert!(verify_integrity(test_data, Some(correct_integrity), Some("wrong_shasum")));
+
+        // If integrity is wrong, should return false even if shasum is correct
+        assert!(!verify_integrity(test_data, Some("sha512-wrong"), Some(correct_shasum)));
+    }
+
+    #[wasm_bindgen_test]
     async fn test_empty_tgz_file_gets_redownloaded() {
         test_utils::init_tracing();
 
@@ -1595,7 +1750,7 @@ mod tests {
         assert_eq!(empty_meta.len(), 0);
 
         // Call install_package - should detect no marker/unpacked_dir and re-download
-        let result = install_package(name, version, &Some(url.to_string()), path_key).await;
+        let result = install_package(name, version, &Some(url.to_string()), None, None, path_key).await;
 
         if result.is_ok() {
             // Verify tgz was replaced with valid content
