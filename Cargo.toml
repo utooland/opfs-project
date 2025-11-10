@@ -15,7 +15,7 @@ exclude = [".gitignore", ".github/", "target/", "pkg/"]
 
 [dependencies]
 serde = { version = "1.0.219", features = ["derive"] }
-flate2 = "1.1.2"
+flate2 = { version = "1.1.5", features = ["zlib-rs"], default-features = false }
 tar = "0.4.44"
 futures = "0.3.31"
 futures-util = "0.3.31"
@@ -27,6 +27,7 @@ anyhow = { version = "1.0", features = ["backtrace"] }
 sha1 = "0.10"
 sha2 = "0.10"
 data-encoding = "2.5"
+md-5 = "0.10"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tracing-web = "0.1"
