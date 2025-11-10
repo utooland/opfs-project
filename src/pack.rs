@@ -181,6 +181,23 @@ pub async fn gzip_dir<S: AsRef<Path>, D: AsRef<Path>>(src: S, dest: D) -> Result
     gzip(files, dest).await
 }
 
+/// Create a tar.gz archive and return bytes (no file I/O)
+///
+/// This is a pure compression function that returns the compressed bytes
+/// without writing to disk. Useful for in-memory operations.
+///
+/// # Example
+/// ```ignore
+/// let files = vec![
+///     PackFile::new("file1.txt", b"content1".to_vec()),
+///     PackFile::new("file2.txt", b"content2".to_vec()),
+/// ];
+/// let compressed_bytes = gzip_to_bytes(files)?;
+/// ```
+pub fn gzip_to_bytes(files: Vec<PackFile>) -> Result<Vec<u8>> {
+    create_tar_gz_bytes(files)
+}
+
 /// Create tar.gz archive bytes from file entries
 fn create_tar_gz_bytes(files: Vec<PackFile>) -> Result<Vec<u8>> {
     use flate2::{Compression, GzBuilder};
