@@ -8,6 +8,7 @@ use std::{
 mod fuse;
 mod package_lock;
 pub mod package_manager;
+pub mod pack;
 mod util;
 
 pub use tokio_fs_ext::DirEntry;
