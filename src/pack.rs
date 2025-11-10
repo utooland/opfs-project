@@ -5,23 +5,35 @@ use sha1::Sha1;
 use sha2::Sha512;
 use data_encoding::BASE64;
 
-/// Generate MD5 signature for a file path
-pub async fn sign<P: AsRef<Path>>(path: P) -> Result<String> {
+/// Calculate MD5 hash of byte content
+///
+/// Returns a hex-encoded MD5 hash string.
+///
+/// # Example
+/// ```ignore
+/// let hash = sig_md5(b"hello world");
+/// assert_eq!(hash, "5eb63bbbe01eeed093cb22bb8f5acdc3");
+/// ```
+pub fn sig_md5(content: &[u8]) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(content);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Calculate MD5 hash of a file
+///
+/// Reads the file and returns its MD5 hash as a hex-encoded string.
+///
+/// # Example
+/// ```ignore
+/// let hash = sig_md5_file("/path/to/file.txt").await?;
+/// ```
+pub async fn sig_md5_file<P: AsRef<Path>>(path: P) -> Result<String> {
     let path_ref = path.as_ref();
     let content = tokio_fs_ext::read(path_ref)
         .await
         .context(format!("Failed to read file: {}", path_ref.display()))?;
-
-    let mut hasher = Md5::new();
-    hasher.update(&content);
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-/// Generate MD5 signature for byte content
-pub fn sign_bytes(content: &[u8]) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(content);
-    format!("{:x}", hasher.finalize())
+    Ok(sig_md5(&content))
 }
 
 /// Verify file integrity using shasum or integrity field
@@ -85,9 +97,9 @@ impl PackFile {
 ///     PackFile::new("src/main.rs", b"fn main() {}".to_vec()),
 ///     PackFile::new("Cargo.toml", b"[package]".to_vec()),
 /// ];
-/// zip_files(files, "./archive.tar.gz").await?;
+/// gzip(files, "./archive.tar.gz").await?;
 /// ```
-pub async fn zip_files<D: AsRef<Path>>(files: Vec<PackFile>, dest: D) -> Result<()> {
+pub async fn gzip<D: AsRef<Path>>(files: Vec<PackFile>, dest: D) -> Result<()> {
     let dest_ref = dest.as_ref();
 
     // Create destination directory if it doesn't exist
@@ -157,11 +169,16 @@ pub async fn collect_dir_files(base_dir: &Path) -> Result<Vec<PackFile>> {
 
 /// Convenience function: Create a tar.gz archive from a directory
 ///
-/// This combines `collect_dir_files` and `zip_files` for the common use case.
-/// For more control over which files to include, use `zip_files` directly.
-pub async fn zip<S: AsRef<Path>, D: AsRef<Path>>(src: S, dest: D) -> Result<()> {
+/// This combines `collect_dir_files` and `gzip` for the common use case.
+/// For more control over which files to include, use `gzip` directly.
+///
+/// # Example
+/// ```ignore
+/// gzip_dir("./project", "./backup.tar.gz").await?;
+/// ```
+pub async fn gzip_dir<S: AsRef<Path>, D: AsRef<Path>>(src: S, dest: D) -> Result<()> {
     let files = collect_dir_files(src.as_ref()).await?;
-    zip_files(files, dest).await
+    gzip(files, dest).await
 }
 
 /// Create tar.gz archive bytes from file entries
@@ -176,8 +193,17 @@ fn create_tar_gz_bytes(files: Vec<PackFile>) -> Result<Vec<u8>> {
     let mut archive = Builder::new(encoder);
 
     for file in files {
+        let mut header = tar::Header::new_ustar();
+        header.set_path(&file.path)
+            .context(format!("Failed to set path: {}", file.path.display()))?;
+        header.set_size(file.content.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(1700000000); // Use a fixed timestamp for reproducibility
+        header.set_uid(1000);
+        header.set_gid(1000);
+        header.set_cksum();
         archive
-            .append_data(&mut tar::Header::new_gnu(), &file.path, file.content.as_slice())
+            .append(&header, file.content.as_slice())
             .context(format!("Failed to append file: {}", file.path.display()))?;
     }
 
@@ -197,8 +223,15 @@ mod tests {
     use super::*;
 
     #[wasm_bindgen_test]
-    async fn test_sign_function() {
-        let temp_path = "/test-sign-function";
+    fn test_sig_md5() {
+        let content = b"Hello, World!";
+        let hash = sig_md5(content);
+        assert_eq!(hash, "65a8e27d8879283831b664bd8b7f0ad4");
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_sig_md5_file() {
+        let temp_path = "/test-sig-md5-file";
         tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
 
         // Create a test file
@@ -206,18 +239,11 @@ mod tests {
         let content = b"Hello, World!";
         tokio_fs_ext::write(&test_file, content).await.unwrap();
 
-        // Get MD5 signature
-        let signature = sign(&test_file).await.unwrap();
+        // Get MD5 hash
+        let hash = sig_md5_file(&test_file).await.unwrap();
 
         // Expected MD5 for "Hello, World!" is 65a8e27d8879283831b664bd8b7f0ad4
-        assert_eq!(signature, "65a8e27d8879283831b664bd8b7f0ad4");
-    }
-
-    #[wasm_bindgen_test]
-    fn test_sign_bytes() {
-        let content = b"Hello, World!";
-        let signature = sign_bytes(content);
-        assert_eq!(signature, "65a8e27d8879283831b664bd8b7f0ad4");
+        assert_eq!(hash, "65a8e27d8879283831b664bd8b7f0ad4");
     }
 
     #[wasm_bindgen_test]
@@ -275,14 +301,14 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    async fn test_sign_nonexistent_file() {
-        let result = sign("/nonexistent/file.txt").await;
+    async fn test_sig_md5_file_nonexistent() {
+        let result = sig_md5_file("/nonexistent/file.txt").await;
         assert!(result.is_err());
     }
 
     #[wasm_bindgen_test]
-    async fn test_zip_files_api() {
-        let temp_path = "/test-zip-files-api";
+    async fn test_gzip() {
+        let temp_path = "/test-gzip";
         tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
 
         // Create file list manually
@@ -294,8 +320,8 @@ mod tests {
 
         let dist_file = format!("{}/custom.tar.gz", temp_path);
 
-        // Create archive using zip_files
-        let result = zip_files(files, &dist_file).await;
+        // Create archive using gzip
+        let result = gzip(files, &dist_file).await;
         assert!(result.is_ok(), "Failed to create archive: {:?}", result);
 
         // Verify archive was created
@@ -334,7 +360,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    async fn test_zip_function() {
+    async fn test_gzip_dir() {
         let temp_path = "/test-zip-function";
         tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
 
@@ -358,8 +384,8 @@ mod tests {
         // Create destination path
         let dist_file = format!("{}/archive.tar.gz", temp_path);
 
-        // Create zip archive
-        let result = zip(&src_dir, &dist_file).await;
+        // Create gzip archive
+        let result = gzip_dir(&src_dir, &dist_file).await;
         assert!(result.is_ok(), "Failed to create archive: {:?}", result);
 
         // Verify archive was created
@@ -372,7 +398,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    async fn test_zip_empty_directory() {
+    async fn test_gzip_empty_directory() {
         let temp_path = "/test-zip-empty";
         tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
 
@@ -383,7 +409,7 @@ mod tests {
         // Create destination path
         let dist_file = format!("{}/empty.tar.gz", temp_path);
 
-        // Create zip archive of empty directory
+        // Create gzip archive of empty directory
         let result = zip(&src_dir, &dist_file).await;
         assert!(result.is_ok());
 
@@ -393,7 +419,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    async fn test_zip_nested_structure() {
+    async fn test_gzip_nested_structure() {
         let temp_path = "/test-zip-nested";
         tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
 
@@ -427,13 +453,13 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    async fn test_zip_nonexistent_source() {
+    async fn test_gzip_nonexistent_source() {
         let result = zip("/nonexistent/source", "/tmp/output.tar.gz").await;
         assert!(result.is_err());
     }
 
     #[wasm_bindgen_test]
-    async fn test_zip_creates_parent_directory() {
+    async fn test_gzip_creates_parent_directory() {
         let temp_path = "/test-zip-parent";
         tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
 
