@@ -1598,6 +1598,11 @@ mod tests {
 
         let paths = PackagePaths::new(name, url, path_key);
 
+        // Clean up any existing files from previous test runs
+        let _ = tokio_fs_ext::remove_file(&paths.resolved_marker).await;
+        let _ = tokio_fs_ext::remove_dir_all(&paths.unpacked_dir).await;
+        let _ = tokio_fs_ext::remove_file(&paths.tgz_store_path).await;
+
         // Create an empty/corrupted tgz file in the store
         tokio_fs_ext::create_dir_all(paths.tgz_store_path.parent().unwrap())
             .await
@@ -1708,6 +1713,11 @@ mod tests {
         let path_key = "node_modules/test-empty-tgz";
 
         let paths = PackagePaths::new(name, url, path_key);
+
+        // Clean up any existing files from previous test runs
+        let _ = tokio_fs_ext::remove_file(&paths.resolved_marker).await;
+        let _ = tokio_fs_ext::remove_dir_all(&paths.unpacked_dir).await;
+        let _ = tokio_fs_ext::remove_file(&paths.tgz_store_path).await;
 
         // Create an empty tgz file in the store
         tokio_fs_ext::create_dir_all(paths.tgz_store_path.parent().unwrap())
