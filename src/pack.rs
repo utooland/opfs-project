@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use md5::{Md5, Digest};
-use sha1::{Sha1, Digest as Sha1Digest};
-use sha2::{Sha512, Digest as Sha512Digest};
+use sha1::Sha1;
+use sha2::Sha512;
 use data_encoding::BASE64;
 
 /// Generate MD5 signature for a file path
@@ -55,61 +55,139 @@ pub fn verify_integrity(file_bytes: &[u8], integrity: Option<&str>, shasum: Opti
     false
 }
 
-/// Create a tar.gz archive from source directory to destination file
-///
-/// This function performs I/O operations in a blocking context to avoid
-/// blocking the async runtime. The actual tar creation happens in a
-/// separate thread pool.
-pub async fn zip<S: AsRef<Path>, D: AsRef<Path>>(src: S, dist: D) -> Result<()> {
-    let src_path = src.as_ref().to_path_buf();
-    let dist_path = dist.as_ref().to_path_buf();
+/// File entry for creating archives
+#[derive(Debug, Clone)]
+pub struct PackFile {
+    /// Relative path in the archive
+    pub path: std::path::PathBuf,
+    /// File content
+    pub content: Vec<u8>,
+}
 
-    // Create destination directory if it doesn't exist (async)
-    if let Some(parent) = dist_path.parent() {
+impl PackFile {
+    /// Create a new PackFile
+    pub fn new(path: impl Into<std::path::PathBuf>, content: Vec<u8>) -> Self {
+        Self {
+            path: path.into(),
+            content,
+        }
+    }
+}
+
+/// Create a tar.gz archive from a list of files and write to destination
+///
+/// This is a pure compression function that only handles creating the archive.
+/// File collection is left to the caller, providing maximum flexibility.
+///
+/// # Example
+/// ```ignore
+/// let files = vec![
+///     PackFile::new("src/main.rs", b"fn main() {}".to_vec()),
+///     PackFile::new("Cargo.toml", b"[package]".to_vec()),
+/// ];
+/// zip_files(files, "./archive.tar.gz").await?;
+/// ```
+pub async fn zip_files<D: AsRef<Path>>(files: Vec<PackFile>, dest: D) -> Result<()> {
+    let dest_ref = dest.as_ref();
+
+    // Create destination directory if it doesn't exist
+    if let Some(parent) = dest_ref.parent() {
         tokio_fs_ext::create_dir_all(parent)
             .await
             .context(format!("Failed to create parent directory: {}", parent.display()))?;
     }
 
-    // Perform blocking I/O operations in a separate thread
-    tokio::task::spawn_blocking(move || {
-        create_tar_gz(&src_path, &dist_path)
-    })
-    .await
-    .context("Failed to spawn blocking task")?
-    .context(format!(
-        "Failed to create archive from {} to {}",
-        src_path.display(),
-        dist_path.display()
-    ))
-}
+    // Create tar.gz archive in memory
+    let archive_data = create_tar_gz_bytes(files)
+        .context("Failed to create tar.gz archive")?;
 
-/// Create tar.gz archive (blocking operation)
-fn create_tar_gz(src: &Path, dist: &Path) -> Result<()> {
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
-    use tar::Builder;
-    use std::fs::File;
-
-    // Create tar.gz file
-    let file = File::create(dist)
-        .context(format!("Failed to create archive file: {}", dist.display()))?;
-
-    let enc = GzEncoder::new(file, Compression::default());
-    let mut tar = Builder::new(enc);
-
-    // Add source directory to archive
-    tar.append_dir_all(".", src)
-        .context(format!("Failed to add directory to archive: {}", src.display()))?;
-
-    // Finish writing
-    let encoder = tar.into_inner()
-        .context("Failed to finalize tar archive")?;
-
-    encoder.finish()
-        .context("Failed to finish gzip compression")?;
+    // Write archive to disk
+    tokio_fs_ext::write(dest_ref, &archive_data)
+        .await
+        .context(format!("Failed to write archive to: {}", dest_ref.display()))?;
 
     Ok(())
+}
+
+/// Helper function: Recursively collect all files in a directory
+///
+/// This is a convenience function for the common use case of archiving an entire directory.
+/// For more control, use `zip_files` directly with your own file list.
+pub async fn collect_dir_files(base_dir: &Path) -> Result<Vec<PackFile>> {
+    let mut files = Vec::new();
+    let mut stack = vec![base_dir.to_path_buf()];
+
+    while let Some(current_dir) = stack.pop() {
+        // tokio_fs_ext::read_dir returns ReadDir, need to collect to get Vec<DirEntry>
+        let read_dir = tokio_fs_ext::read_dir(&current_dir)
+            .await
+            .context(format!("Failed to read directory: {}", current_dir.display()))?;
+
+        let entries = read_dir.collect::<Result<Vec<_>, _>>()
+            .context(format!("Failed to collect directory entries: {}", current_dir.display()))?;
+
+        for entry in entries {
+            let path = entry.path();
+
+            // Use tokio_fs_ext::metadata instead of entry.metadata()
+            // because entry.metadata() is not implemented in WASM
+            let metadata = tokio_fs_ext::metadata(&path)
+                .await
+                .context(format!("Failed to get metadata: {}", path.display()))?;
+
+            if metadata.is_dir() {
+                stack.push(path);
+            } else {
+                let content = tokio_fs_ext::read(&path)
+                    .await
+                    .context(format!("Failed to read file: {}", path.display()))?;
+
+                let relative_path = path
+                    .strip_prefix(base_dir)
+                    .context(format!("Failed to strip prefix: {}", path.display()))?
+                    .to_path_buf();
+
+                files.push(PackFile::new(relative_path, content));
+            }
+        }
+    }
+
+    Ok(files)
+}
+
+/// Convenience function: Create a tar.gz archive from a directory
+///
+/// This combines `collect_dir_files` and `zip_files` for the common use case.
+/// For more control over which files to include, use `zip_files` directly.
+pub async fn zip<S: AsRef<Path>, D: AsRef<Path>>(src: S, dest: D) -> Result<()> {
+    let files = collect_dir_files(src.as_ref()).await?;
+    zip_files(files, dest).await
+}
+
+/// Create tar.gz archive bytes from file entries
+fn create_tar_gz_bytes(files: Vec<PackFile>) -> Result<Vec<u8>> {
+    use flate2::{Compression, GzBuilder};
+    use tar::Builder;
+
+    let buffer = Vec::new();
+    let encoder = GzBuilder::new()
+        .write(buffer, Compression::default());
+
+    let mut archive = Builder::new(encoder);
+
+    for file in files {
+        archive
+            .append_data(&mut tar::Header::new_gnu(), &file.path, file.content.as_slice())
+            .context(format!("Failed to append file: {}", file.path.display()))?;
+    }
+
+    let encoder = archive.into_inner()
+        .context("Failed to finalize tar archive")?;
+
+    let buffer = encoder.finish()
+        .context("Failed to finish gzip compression")?;
+
+    Ok(buffer)
 }
 
 #[cfg(test)]
@@ -200,6 +278,59 @@ mod tests {
     async fn test_sign_nonexistent_file() {
         let result = sign("/nonexistent/file.txt").await;
         assert!(result.is_err());
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_zip_files_api() {
+        let temp_path = "/test-zip-files-api";
+        tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
+
+        // Create file list manually
+        let files = vec![
+            PackFile::new("file1.txt", b"content1".to_vec()),
+            PackFile::new("dir/file2.txt", b"content2".to_vec()),
+            PackFile::new("README.md", b"# Test".to_vec()),
+        ];
+
+        let dist_file = format!("{}/custom.tar.gz", temp_path);
+
+        // Create archive using zip_files
+        let result = zip_files(files, &dist_file).await;
+        assert!(result.is_ok(), "Failed to create archive: {:?}", result);
+
+        // Verify archive was created
+        let metadata = tokio_fs_ext::metadata(&dist_file).await;
+        assert!(metadata.is_ok(), "Archive file should exist");
+        assert!(metadata.unwrap().len() > 0, "Archive should not be empty");
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_collect_dir_files() {
+        let temp_path = "/test-collect-dir-files";
+        tokio_fs_ext::create_dir_all(&temp_path).await.unwrap();
+
+        // Create test directory structure
+        let src_dir = format!("{}/src", temp_path);
+        tokio_fs_ext::create_dir_all(&src_dir).await.unwrap();
+        tokio_fs_ext::write(&format!("{}/file1.txt", src_dir), b"content1")
+            .await
+            .unwrap();
+
+        let sub_dir = format!("{}/sub", src_dir);
+        tokio_fs_ext::create_dir_all(&sub_dir).await.unwrap();
+        tokio_fs_ext::write(&format!("{}/file2.txt", sub_dir), b"content2")
+            .await
+            .unwrap();
+
+        // Collect files
+        let files = collect_dir_files(std::path::Path::new(&src_dir))
+            .await
+            .unwrap();
+
+        // Verify collected files
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|f| f.path.to_str() == Some("file1.txt")));
+        assert!(files.iter().any(|f| f.path.to_str() == Some("sub/file2.txt")));
     }
 
     #[wasm_bindgen_test]
