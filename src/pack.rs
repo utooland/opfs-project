@@ -4,6 +4,12 @@ use sha1::Sha1;
 use sha2::Sha512;
 use data_encoding::BASE64;
 
+#[cfg(target_arch = "wasm32")]
+use web_time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime, UNIX_EPOCH};
+
 /// Calculate MD5 hash of byte content
 ///
 /// Returns a hex-encoded MD5 hash string.
@@ -90,8 +96,8 @@ pub fn gzip(files: &[PackFile]) -> Result<Vec<u8>> {
     let mut archive = Builder::new(encoder);
 
     // Get current timestamp in seconds since epoch
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
