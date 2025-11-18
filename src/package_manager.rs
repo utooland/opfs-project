@@ -4,11 +4,9 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use std::io::Read;
 use std::path::PathBuf;
 use tar::Archive;
-use sha1::{Sha1, Digest};
-use sha2::Sha512;
-use data_encoding::BASE64;
 
 use super::fuse;
+use crate::pack;
 
 use crate::package_lock::PackageLock;
 
@@ -170,7 +168,7 @@ async fn download_tgz(
     if let Ok(existing_bytes) = tokio_fs_ext::read(tgz_store_path).await {
         if integrity.is_some() || shasum.is_some() {
             // If we have integrity/shasum info, verify the existing file
-            if verify_integrity(&existing_bytes, integrity, shasum) {
+            if pack::verify_integrity(&existing_bytes, integrity, shasum) {
                 // Existing file is valid, use it
                 return Ok(existing_bytes);
             }
@@ -183,7 +181,7 @@ async fn download_tgz(
 
     // Verify downloaded file if integrity/shasum is provided
     if integrity.is_some() || shasum.is_some() {
-        if !verify_integrity(&bytes, integrity, shasum) {
+        if !pack::verify_integrity(&bytes, integrity, shasum) {
             return Err(anyhow::anyhow!(
                 "Downloaded file integrity check failed for {}",
                 tgz_url
@@ -381,32 +379,6 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-/// Verify file integrity using shasum or integrity field
-/// Returns true if the file matches the expected hash, false otherwise
-fn verify_integrity(file_bytes: &[u8], integrity: Option<&str>, shasum: Option<&str>) -> bool {
-    // Try integrity first (sha512)
-    if let Some(integrity_str) = integrity {
-        if let Some(hash_part) = integrity_str.strip_prefix("sha512-") {
-            let mut hasher = Sha512::new();
-            hasher.update(file_bytes);
-            let result = hasher.finalize();
-            let calculated = BASE64.encode(&result);
-            return calculated == hash_part;
-        }
-    }
-
-    // Fall back to shasum (sha1)
-    if let Some(expected_shasum) = shasum {
-        let mut hasher = Sha1::new();
-        hasher.update(file_bytes);
-        let result = hasher.finalize();
-        let calculated = format!("{:x}", result);
-        return calculated == expected_shasum;
-    }
-
-    // If no hash information is available, we can't verify
-    false
-}
 #[cfg(test)]
 mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -1626,6 +1598,11 @@ mod tests {
 
         let paths = PackagePaths::new(name, url, path_key);
 
+        // Clean up any existing files from previous test runs
+        let _ = tokio_fs_ext::remove_file(&paths.resolved_marker).await;
+        let _ = tokio_fs_ext::remove_dir_all(&paths.unpacked_dir).await;
+        let _ = tokio_fs_ext::remove_file(&paths.tgz_store_path).await;
+
         // Create an empty/corrupted tgz file in the store
         tokio_fs_ext::create_dir_all(paths.tgz_store_path.parent().unwrap())
             .await
@@ -1686,13 +1663,13 @@ mod tests {
         let expected_shasum = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed";
 
         // Verify with correct shasum
-        assert!(verify_integrity(test_data, None, Some(expected_shasum)));
+        assert!(pack::verify_integrity(test_data, None, Some(expected_shasum)));
 
         // Verify with incorrect shasum
-        assert!(!verify_integrity(test_data, None, Some("incorrect_hash")));
+        assert!(!pack::verify_integrity(test_data, None, Some("incorrect_hash")));
 
         // Verify with no hash info
-        assert!(!verify_integrity(test_data, None, None));
+        assert!(!pack::verify_integrity(test_data, None, None));
     }
 
     #[wasm_bindgen_test]
@@ -1704,10 +1681,10 @@ mod tests {
         let expected_integrity = "sha512-MJ7MSJwS1utMxA9QyQLytNDtd+5RGnx6m808qG1M2G+YndNbxf9JlnDaNCVbRbDP2DDoH2Bdz33FVC6TrpzXbw==";
 
         // Verify with correct integrity
-        assert!(verify_integrity(test_data, Some(expected_integrity), None));
+        assert!(pack::verify_integrity(test_data, Some(expected_integrity), None));
 
         // Verify with incorrect integrity
-        assert!(!verify_integrity(test_data, Some("sha512-incorrect"), None));
+        assert!(!pack::verify_integrity(test_data, Some("sha512-incorrect"), None));
     }
 
     #[wasm_bindgen_test]
@@ -1720,10 +1697,10 @@ mod tests {
 
         // When both are provided, integrity should take priority
         // If integrity is correct, should return true even if shasum is wrong
-        assert!(verify_integrity(test_data, Some(correct_integrity), Some("wrong_shasum")));
+        assert!(pack::verify_integrity(test_data, Some(correct_integrity), Some("wrong_shasum")));
 
         // If integrity is wrong, should return false even if shasum is correct
-        assert!(!verify_integrity(test_data, Some("sha512-wrong"), Some(correct_shasum)));
+        assert!(!pack::verify_integrity(test_data, Some("sha512-wrong"), Some(correct_shasum)));
     }
 
     #[wasm_bindgen_test]
@@ -1736,6 +1713,11 @@ mod tests {
         let path_key = "node_modules/test-empty-tgz";
 
         let paths = PackagePaths::new(name, url, path_key);
+
+        // Clean up any existing files from previous test runs
+        let _ = tokio_fs_ext::remove_file(&paths.resolved_marker).await;
+        let _ = tokio_fs_ext::remove_dir_all(&paths.unpacked_dir).await;
+        let _ = tokio_fs_ext::remove_file(&paths.tgz_store_path).await;
 
         // Create an empty tgz file in the store
         tokio_fs_ext::create_dir_all(paths.tgz_store_path.parent().unwrap())
