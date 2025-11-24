@@ -27,14 +27,6 @@ pub async fn read_dir_direct<P: AsRef<Path>>(path: P) -> Result<Vec<tokio_fs_ext
     read_dir.collect()
 }
 
-/// Read file content as bytes (without fuse.link support)
-pub async fn read_direct<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
-    let prepared_path = crate::util::prepare_path(path);
-    let content = tokio_fs_ext::read(&prepared_path).await?;
-    Ok(content)
-}
-
-
 #[cfg(test)]
 mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);

@@ -63,10 +63,17 @@ fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<std::path::PathBuf> {
                     // Found node_modules, construct the fuse.link path
                     if !temp.0.is_empty() {
                         if temp.1.is_empty() {
-                            // Single component package
-                            let fuse_path = parent.join(temp.0).join("fuse.link");
-                            info!("Found fuse.link path for single component: {}", fuse_path.display());
-                            return Some(fuse_path);
+                            // Single component - check if it's a scope directory
+                            if temp.0.starts_with('@') {
+                                // This is a scope directory (@umi), not a package
+                                // Scope directories don't have fuse.link, continue searching
+                                info!("Found scope directory, not a package: {}", temp.0);
+                            } else {
+                                // Single component package (like 'lodash')
+                                let fuse_path = parent.join(temp.0).join("fuse.link");
+                                info!("Found fuse.link path for single component: {}", fuse_path.display());
+                                return Some(fuse_path);
+                            }
                         } else {
                             // Two component package (could be scope/package or package/subpath)
                             if temp.0.starts_with('@') {
@@ -114,7 +121,7 @@ async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_pa
                     content
                 },
                 Err(e) => {
-                    error!("Failed to read fuse.link file: {:?}", e);
+                    info!("Failed to read fuse.link file: {:?} {:?}", &fuse_link_path, e);
                     return Ok(None);
                 },
             };
@@ -141,7 +148,7 @@ async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_pa
                 content
             },
             Err(e) => {
-                error!("Failed to read fuse.link file: {:?}", e);
+                info!("Failed to read fuse.link file: {:?} {:?}", &fuse_link_path, e);
                 return Ok(None);
             },
         };
@@ -225,9 +232,16 @@ pub(super) async fn try_read_dir_through_fuse_link<P: AsRef<Path> + std::fmt::De
         },
     };
 
-    let target_entries = read_dir_direct(&target_path).await?;
-    info!("Read {} entries from target directory",
-          target_entries.len());
+    let target_entries = match read_dir_direct(&target_path).await {
+        Ok(entries) => {
+            info!("Read {} entries from target directory", entries.len());
+            entries
+        },
+        Err(e) => {
+            info!("Failed to read target directory: {:?}", e);
+            return Ok(None);
+        }
+    };
 
     // Always read original directory and combine with target entries
     // This ensures we always see both the original content (like node_modules) and target content
@@ -682,6 +696,120 @@ mod tests {
         let path = Path::new("/node_modules/@types/node/fs/promises.d.ts");
         let result = get_fuse_link_path(path);
         assert_eq!(result, Some(Path::new("/node_modules/@types/node/fuse.link").to_path_buf()));
+    }
+
+    #[wasm_bindgen_test]
+    fn test_get_fuse_link_path_scope_directory_only() {
+        test_utils::init_tracing();
+
+        // Test that a scope directory alone (without package name) returns None
+        let path = Path::new("./node_modules/@umi");
+        let result = get_fuse_link_path(path);
+
+        // Scope directories don't have fuse.link files
+        assert_eq!(result, None);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_get_fuse_link_path_scope_package() {
+        test_utils::init_tracing();
+
+        // Test that a scoped package returns the correct fuse.link path
+        let path = Path::new("./node_modules/@umi/mypackage");
+        let result = get_fuse_link_path(path);
+
+        assert_eq!(result, Some(Path::new("./node_modules/@umi/mypackage/fuse.link").to_path_buf()));
+    }
+
+    #[wasm_bindgen_test]
+    fn test_get_fuse_link_path_scope_package_with_file() {
+        test_utils::init_tracing();
+
+        // Test that a file within a scoped package returns the package's fuse.link
+        let path = Path::new("./node_modules/@umi/mypackage/index.js");
+        let result = get_fuse_link_path(path);
+
+        assert_eq!(result, Some(Path::new("./node_modules/@umi/mypackage/fuse.link").to_path_buf()));
+    }
+
+    #[wasm_bindgen_test]
+    fn test_get_fuse_link_path_scope_package_deep_path() {
+        test_utils::init_tracing();
+
+        // Test that deeply nested files in scoped packages return correct fuse.link
+        let path = Path::new("./node_modules/@babel/core/lib/util/index.js");
+        let result = get_fuse_link_path(path);
+
+        assert_eq!(result, Some(Path::new("./node_modules/@babel/core/fuse.link").to_path_buf()));
+    }
+
+    #[wasm_bindgen_test]
+    fn test_get_fuse_link_path_regular_package_deep_path() {
+        test_utils::init_tracing();
+
+        // Test that deeply nested files in regular packages return correct fuse.link
+        let path = Path::new("./node_modules/lodash/lib/src/util/index.js");
+        let result = get_fuse_link_path(path);
+
+        assert_eq!(result, Some(Path::new("./node_modules/lodash/fuse.link").to_path_buf()));
+    }
+
+    #[wasm_bindgen_test]
+    fn test_get_fuse_link_path_mixed_nested() {
+        test_utils::init_tracing();
+
+        // Test mixed nesting: scoped package -> node_modules -> regular package
+        let path = Path::new("./node_modules/@scope/pkg/node_modules/other/file.js");
+        let result = get_fuse_link_path(path);
+
+        // Should find the innermost node_modules package first
+        assert_eq!(result, Some(Path::new("./node_modules/@scope/pkg/node_modules/other/fuse.link").to_path_buf()));
+    }
+
+    #[wasm_bindgen_test]
+    fn test_get_fuse_link_path_edge_case_empty_path() {
+        test_utils::init_tracing();
+
+        // Test empty path
+        let path = Path::new("");
+        let result = get_fuse_link_path(path);
+
+        assert_eq!(result, None);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_get_fuse_link_path_edge_case_just_node_modules() {
+        test_utils::init_tracing();
+
+        // Test path that is just node_modules
+        let path = Path::new("./node_modules");
+        let result = get_fuse_link_path(path);
+
+        assert_eq!(result, None);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_get_fuse_link_path_multiple_at_signs() {
+        test_utils::init_tracing();
+
+        // Edge case: multiple @ symbols (invalid npm package name but shouldn't crash)
+        let path = Path::new("./node_modules/@scope1/@scope2/file.js");
+        let result = get_fuse_link_path(path);
+
+        // Should treat @scope2 as package name within @scope1
+        assert_eq!(result, Some(Path::new("./node_modules/@scope1/@scope2/fuse.link").to_path_buf()));
+    }
+
+    #[wasm_bindgen_test]
+    fn test_get_fuse_link_path_very_deep_nesting() {
+        test_utils::init_tracing();
+
+        // Test very deep nesting (4 levels of node_modules)
+        let path = Path::new("./node_modules/a/node_modules/b/node_modules/c/node_modules/d/file.js");
+        let result = get_fuse_link_path(path);
+
+        // Should find the deepest package first
+        assert_eq!(result, Some(Path::new("./node_modules/a/node_modules/b/node_modules/c/node_modules/d/fuse.link").to_path_buf()));
     }
 
     #[wasm_bindgen_test]

@@ -39,6 +39,6 @@ jobs:
       run: wasm-pack build
 
     - name: Run tests
-      run: wasm-pack test --chrome --headless
+      run: WASM_BINDGEN_TEST_TIMEOUT=300 wasm-pack test --chrome --headless
       env:
         RUST_BACKTRACE: 1

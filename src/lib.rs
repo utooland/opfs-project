@@ -10,6 +10,7 @@ mod fuse;
 mod package_lock;
 pub mod package_manager;
 mod registry_fs;
+pub mod pack;
 mod util;
 
 pub use tokio_fs_ext::DirEntry;
