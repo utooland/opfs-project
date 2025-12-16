@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tar::Archive;
 
 use super::fuse;
@@ -10,12 +10,12 @@ use crate::pack;
 
 use crate::package_lock::PackageLock;
 
-/// Download all tgz packages to OPFS
-pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -> Result<()> {
+/// Download all tgz packages to OPFS for a specific project root
+pub async fn install_deps(project_root: &Path, package_lock: &str, max_concurrent_downloads: usize) -> Result<()> {
     let lock = PackageLock::from_json(package_lock)?;
 
-    // Write package.json to root
-    ensure_package_json(&lock).await?;
+    // Write package.json to project root
+    ensure_package_json(project_root, &lock).await?;
 
     // Prepare package info for installation
     let packages: Vec<_> = lock
@@ -46,7 +46,7 @@ pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -
             }
         };
 
-        let paths = PackagePaths::new(&name, url, &path_key);
+        let paths = PackagePaths::new(project_root, &name, url, &path_key);
 
         // Check if already unpacked (strict check: marker must be file, unpacked_dir must be directory)
         // If _resolved marker exists, it means the package has been verified and extracted successfully
@@ -79,8 +79,11 @@ pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -
 
     // Step 3: Download and install packages with concurrency control
     stream::iter(packages_to_download)
-        .map(|(name, version, tgz_url, integrity, shasum, path_key)| async move {
-            install_package(&name, &version, &tgz_url, integrity.as_deref(), shasum.as_deref(), &path_key).await
+        .map(|(name, version, tgz_url, integrity, shasum, path_key)| {
+            let project_root = project_root.to_path_buf();
+            async move {
+                install_package(&project_root, &name, &version, &tgz_url, integrity.as_deref(), shasum.as_deref(), &path_key).await
+            }
         })
         .buffer_unordered(max_concurrent_downloads)
         .try_collect::<()>()
@@ -88,8 +91,10 @@ pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -
 }
 
 /// Write root package.json to the project directory
-async fn ensure_package_json(lock: &PackageLock) -> Result<()> {
-    if tokio_fs_ext::metadata(&format!("./package.json"))
+async fn ensure_package_json(project_root: &Path, lock: &PackageLock) -> Result<()> {
+    let package_json_path = project_root.join("package.json");
+    
+    if tokio_fs_ext::metadata(&package_json_path)
         .await
         .is_ok()
     {
@@ -98,14 +103,16 @@ async fn ensure_package_json(lock: &PackageLock) -> Result<()> {
 
     if let Some(root_pkg) = lock.packages.get("") {
         let pkg_json = serde_json::to_string_pretty(root_pkg).unwrap_or("{}".to_string());
-        tokio_fs_ext::create_dir_all(&format!("./node_modules")).await?;
-        tokio_fs_ext::write(&format!("./package.json"), pkg_json.as_bytes()).await?;
+        let node_modules_path = project_root.join("node_modules");
+        tokio_fs_ext::create_dir_all(&node_modules_path).await?;
+        tokio_fs_ext::write(&package_json_path, pkg_json.as_bytes()).await?;
     }
     Ok(())
 }
 
 /// Install package using the provided URL
 async fn install_package(
+    project_root: &Path,
     name: &str,
     version: &str,
     tgz_url: &Option<String>,
@@ -117,7 +124,7 @@ async fn install_package(
         .as_ref()
         .with_context(|| format!("{}@{}: no resolved field", name, version))?;
 
-    let paths = PackagePaths::new(name, url, path_key);
+    let paths = PackagePaths::new(project_root, name, url, path_key);
 
     // Check if already unpacked by checking for both resolved marker and unpacked directory
     // If _resolved marker exists, it means the package has been verified and extracted successfully
@@ -202,15 +209,22 @@ struct PackagePaths {
 }
 
 impl PackagePaths {
-    fn new(name: &str, tgz_url: &str, path_key: &str) -> Self {
+    fn new(project_root: &Path, name: &str, tgz_url: &str, path_key: &str) -> Self {
         let url_path: Vec<_> = tgz_url.split('/').collect();
         let tgz_file_name = url_path.last().unwrap_or(&"package.tgz");
+
+        // Store paths remain global (shared cache), but link_target is project-specific
+        let link_target = if path_key.starts_with('/') {
+            PathBuf::from(path_key)
+        } else {
+            project_root.join(path_key)
+        };
 
         Self {
             tgz_store_path: PathBuf::from(format!("/stores/{name}/-/{tgz_file_name}")),
             unpacked_dir: PathBuf::from(format!("/stores/{name}/-/{tgz_file_name}-unpack")),
             resolved_marker: PathBuf::from(format!("/stores/{name}/-/{tgz_file_name}-unpack._resolved")),
-            link_target_dir: PathBuf::from(format!("{path_key}")),
+            link_target_dir: link_target,
         }
     }
 }
@@ -446,10 +460,18 @@ mod tests {
         }
     }
 
+    /// Helper function to create project root path
+    fn project_root(name: &str) -> PathBuf {
+        PathBuf::from(format!("/test-pm-{}", name))
+    }
+
     #[wasm_bindgen_test]
     async fn test_package_paths_new() {
+        let root = project_root("paths-new");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
 
         let paths = PackagePaths::new(
+            &root,
             "lodash",
             "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
             "node_modules/lodash",
@@ -460,13 +482,16 @@ mod tests {
             paths.unpacked_dir.to_string_lossy(),
             "/stores/lodash/-/lodash-4.17.21.tgz-unpack"
         );
-        assert_eq!(paths.link_target_dir.to_string_lossy(), "node_modules/lodash");
+        assert_eq!(paths.link_target_dir, root.join("node_modules/lodash"));
     }
 
     #[wasm_bindgen_test]
     async fn test_package_paths_new_with_complex_url() {
+        let root = project_root("paths-complex");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
 
         let paths = PackagePaths::new(
+            &root,
             "@types/node",
             "https://registry.npmjs.org/@types/node/-/node-18.0.0.tgz",
             "node_modules/@types/node",
@@ -480,7 +505,24 @@ mod tests {
             paths.unpacked_dir.to_string_lossy(),
             "/stores/@types/node/-/node-18.0.0.tgz-unpack"
         );
-        assert_eq!(paths.link_target_dir.to_string_lossy(), "node_modules/@types/node");
+        assert_eq!(paths.link_target_dir, root.join("node_modules/@types/node"));
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_package_paths_new_absolute_path_key_not_joined() {
+        let root = project_root("paths-abs");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
+
+        let abs_path = "/abs/node_modules/lodash";
+        let paths = PackagePaths::new(
+            &root,
+            "lodash",
+            "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+            abs_path,
+        );
+
+        // Should use absolute path directly without joining with root
+        assert_eq!(paths.link_target_dir, PathBuf::from(abs_path));
     }
 
     #[wasm_bindgen_test]
@@ -557,8 +599,11 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_install_package_with_url() {
+        let root = project_root("install-url");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
 
         let result = install_package(
+            &root,
             "lodash",
             "4.17.21",
             &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
@@ -573,8 +618,10 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_install_package_without_url() {
+        let root = project_root("install-no-url");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
 
-        let result = install_package("lodash", "4.17.21", &None, None, None, "node_modules/lodash").await;
+        let result = install_package(&root, "lodash", "4.17.21", &None, None, None, "node_modules/lodash").await;
 
         // Should fail with error about missing resolved field
         assert!(result.is_err());
@@ -586,12 +633,13 @@ mod tests {
     async fn test_ensure_package_json_new_project() {
 
         let project_name = PathBuf::from("/test-project-new");
+        let root = project_name.clone(); // use same path as root
         set_cwd("/test-project-new");
         tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
 
         let lock = create_test_package_lock();
 
-        let result = ensure_package_json(&lock).await;
+        let result = ensure_package_json(&root, &lock).await;
         assert!(result.is_ok());
 
         // Verify package.json was created
@@ -607,6 +655,7 @@ mod tests {
     async fn test_ensure_package_json_existing_project() {
 
         let project_name = PathBuf::from("/test-project-existing");
+        let root = project_name.clone();
         tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
 
         // Create existing package.json
@@ -616,7 +665,7 @@ mod tests {
 
         let lock = create_test_package_lock();
 
-        let result = ensure_package_json(&lock).await;
+        let result = ensure_package_json(&root, &lock).await;
         assert!(result.is_ok());
 
         // Verify existing package.json was not overwritten
@@ -632,9 +681,10 @@ mod tests {
         let lock_json = serde_json::to_string(&lock).unwrap();
 
         let project_name = PathBuf::from("/test-project-install");
+        let root = project_name.clone();
         tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
 
-        let result = install_deps(&lock_json, 10).await;
+        let result = install_deps(&root, &lock_json, 10).await;
 
         // May succeed or fail depending on network availability
         // Just verify it returns a result (not panics)
@@ -646,9 +696,11 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_install_deps_with_invalid_lock() {
 
+        let root = project_root("invalid-lock");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
         let invalid_lock_json = "{ invalid json }";
 
-        let result = install_deps(invalid_lock_json, 10).await;
+        let result = install_deps(&root, invalid_lock_json, 10).await;
         assert!(result.is_err());
     }
 
@@ -693,17 +745,23 @@ mod tests {
         );
 
         let lock_json = serde_json::to_string(&lock).unwrap();
+        let root = project_root("empty-pkgs");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
 
-        let result = install_deps(&lock_json, 10).await;
+        let result = install_deps(&root, &lock_json, 10).await;
         assert!(result.is_ok());
     }
 
     #[wasm_bindgen_test]
     async fn test_install_types_react_package() {
         test_utils::init_tracing();
+        let root = project_root("types-react");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
+        set_cwd(root.to_string_lossy().as_ref()); // for crate::read
 
         // Test installing real @types/react package
         let result = install_package(
+            &root,
             "@types/react",
             "18.0.0",
             &Some("https://registry.npmjs.org/@types/react/-/react-18.0.0.tgz".to_string()),
@@ -716,6 +774,8 @@ mod tests {
         // If installation was successful, verify the package structure
         if result.is_ok() {
             // Check that index.d.ts exists (main type definition file)
+            // Note: install_package now installs relative to root, but crate::read reads relative to CWD
+            // We set CWD to root above so this works
             let index_dts_exists = crate::read("node_modules/@types/react/index.d.ts").await.is_ok();
             assert!(index_dts_exists, "index.d.ts should exist in @types/react");
 
@@ -730,9 +790,13 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_install_scoped_package() {
         test_utils::init_tracing();
+        let root = project_root("scoped-pkg");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
+        set_cwd(root.to_string_lossy().as_ref()); // for crate::read
 
         // Test installing real @babel/runtime package
         let result = install_package(
+            &root,
             "@babel/runtime",
             "7.28.4",
             &Some("https://registry.npmjs.org/@babel/runtime/-/runtime-7.28.4.tgz".to_string()),
@@ -783,7 +847,8 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_nested_node_modules_structure() {
 
-        set_cwd("/nested-test-project");
+        let root = project_root("nested-struct");
+        set_cwd(root.to_string_lossy().as_ref());
         // Create a package lock with three-level nested structure
         let mut packages = std::collections::HashMap::new();
 
@@ -888,7 +953,7 @@ mod tests {
         println!("Package lock JSON: {}", lock_json);
 
         // Test the installation
-        let result = install_deps(&lock_json, 10).await;
+        let result = install_deps(&root, &lock_json, 10).await;
 
         // Installation should either succeed or fail with an error
         // (network issues are acceptable in tests)
@@ -957,9 +1022,12 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_dirty_cache_cleanup_and_reinstall() {
         test_utils::init_tracing();
+        let root = project_root("dirty-cache");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
 
         // First installation
         let result = install_package(
+            &root,
             "test-dirty-cache",
             "1.0.0",
             &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
@@ -975,6 +1043,7 @@ mod tests {
         if result.is_ok() {
             // Verify package.json exists in unpacked directory
             let paths = PackagePaths::new(
+                &root,
                 "test-dirty-cache",
                 "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
                 "node_modules/test-dirty-cache",
@@ -1006,6 +1075,7 @@ mod tests {
             // Second installation - should detect dirty cache and reinstall
             println!("Running second install...");
             let result2 = install_package(
+                &root,
                 "test-dirty-cache",
                 "1.0.0",
                 &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
@@ -1036,9 +1106,12 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_marker_exists_but_dir_missing() {
         test_utils::init_tracing();
+        let root = project_root("marker-only");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
 
         // First installation to create the cache
         let result = install_package(
+            &root,
             "test-marker-only",
             "1.0.0",
             &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
@@ -1053,6 +1126,7 @@ mod tests {
         // If first installation was successful, proceed with test
         if result.is_ok() {
             let paths = PackagePaths::new(
+                &root,
                 "test-marker-only",
                 "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
                 "node_modules/test-marker-only",
@@ -1081,6 +1155,7 @@ mod tests {
             // Second installation - should detect incomplete cache and reinstall
             println!("Running second install with marker-only state...");
             let result2 = install_package(
+                &root,
                 "test-marker-only",
                 "1.0.0",
                 &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
@@ -1114,9 +1189,12 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_dir_exists_but_marker_missing() {
         test_utils::init_tracing();
+        let root = project_root("dir-only");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
 
         // First installation to create the cache
         let result = install_package(
+            &root,
             "test-dir-only",
             "1.0.0",
             &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
@@ -1131,6 +1209,7 @@ mod tests {
         // If first installation was successful, proceed with test
         if result.is_ok() {
             let paths = PackagePaths::new(
+                &root,
                 "test-dir-only",
                 "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
                 "node_modules/test-dir-only",
@@ -1159,6 +1238,7 @@ mod tests {
             // Second installation - should detect incomplete cache and reinstall (overwrite)
             println!("Running second install with dir-only state...");
             let result2 = install_package(
+                &root,
                 "test-dir-only",
                 "1.0.0",
                 &Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
@@ -1192,9 +1272,12 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_install_package_with_invalid_url() {
         test_utils::init_tracing();
+        let root = project_root("invalid-url");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
 
         // Test with invalid URL that should fail
         let result = install_package(
+            &root,
             "invalid-package",
             "1.0.0",
             &Some("https://invalid-domain-that-does-not-exist.com/package.tgz".to_string()),
@@ -1234,6 +1317,8 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_install_deps_with_mixed_success_and_failure() {
         test_utils::init_tracing();
+        let root = project_root("mixed-result");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
 
         let mut packages = std::collections::HashMap::new();
 
@@ -1315,7 +1400,7 @@ mod tests {
         let lock_json = serde_json::to_string(&lock).unwrap();
 
         // Should fail because one package has no resolved field
-        let result = install_deps(&lock_json, 10).await;
+        let result = install_deps(&root, &lock_json, 10).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         // The error should contain information about the missing resolved field
@@ -1404,6 +1489,8 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_marker_as_directory_not_cached() {
         test_utils::init_tracing();
+        let root = project_root("marker-as-dir");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
 
         let mut packages = std::collections::HashMap::new();
 
@@ -1462,6 +1549,7 @@ mod tests {
 
         // Create paths
         let paths = PackagePaths::new(
+            &root,
             "test-pkg",
             "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
             "node_modules/test-pkg",
@@ -1477,7 +1565,7 @@ mod tests {
 
         // This should NOT treat the package as cached because marker is a directory, not a file
         // It should attempt to download and install
-        let result = install_deps(&lock_json, 10).await;
+        let result = install_deps(&root, &lock_json, 10).await;
 
         // We expect this to either:
         // 1. Succeed (if network is available) - marker gets replaced with proper file
@@ -1497,6 +1585,8 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_unpacked_dir_as_file_not_cached() {
         test_utils::init_tracing();
+        let root = project_root("unpacked-dir-file");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
 
         let mut packages = std::collections::HashMap::new();
 
@@ -1555,6 +1645,7 @@ mod tests {
 
         // Create paths
         let paths = PackagePaths::new(
+            &root,
             "test-pkg2",
             "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
             "node_modules/test-pkg2",
@@ -1571,7 +1662,7 @@ mod tests {
         let lock_json = serde_json::to_string(&lock).unwrap();
 
         // This should NOT treat the package as cached because unpacked_dir is a file, not a directory
-        let result = install_deps(&lock_json, 10).await;
+        let result = install_deps(&root, &lock_json, 10).await;
 
         // We expect this to either:
         // 1. Succeed (if network is available) - unpacked_dir gets replaced with proper directory
@@ -1590,13 +1681,15 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_corrupted_tgz_file_gets_redownloaded() {
         test_utils::init_tracing();
+        let root = project_root("corrupted-tgz");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
 
         let name = "test-corrupted-tgz";
         let version = "1.0.0";
         let url = "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
         let path_key = "node_modules/test-corrupted-tgz";
 
-        let paths = PackagePaths::new(name, url, path_key);
+        let paths = PackagePaths::new(&root, name, url, path_key);
 
         // Clean up any existing files from previous test runs
         let _ = tokio_fs_ext::remove_file(&paths.resolved_marker).await;
@@ -1617,7 +1710,7 @@ mod tests {
         assert_eq!(corrupted_size, 14); // "corrupted data".len()
 
         // Call install_package - should detect no marker/unpacked_dir and re-download
-        let result = install_package(name, version, &Some(url.to_string()), None, None, path_key).await;
+        let result = install_package(&root, name, version, &Some(url.to_string()), None, None, path_key).await;
 
         if result.is_ok() {
             // Verify tgz was replaced with valid content
@@ -1706,13 +1799,15 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_empty_tgz_file_gets_redownloaded() {
         test_utils::init_tracing();
+        let root = project_root("empty-tgz");
+        tokio_fs_ext::create_dir_all(&root).await.unwrap();
 
         let name = "test-empty-tgz";
         let version = "1.0.0";
         let url = "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
         let path_key = "node_modules/test-empty-tgz";
 
-        let paths = PackagePaths::new(name, url, path_key);
+        let paths = PackagePaths::new(&root, name, url, path_key);
 
         // Clean up any existing files from previous test runs
         let _ = tokio_fs_ext::remove_file(&paths.resolved_marker).await;
@@ -1732,7 +1827,7 @@ mod tests {
         assert_eq!(empty_meta.len(), 0);
 
         // Call install_package - should detect no marker/unpacked_dir and re-download
-        let result = install_package(name, version, &Some(url.to_string()), None, None, path_key).await;
+        let result = install_package(&root, name, version, &Some(url.to_string()), None, None, path_key).await;
 
         if result.is_ok() {
             // Verify tgz was replaced with valid content
