@@ -79,10 +79,12 @@ pub async fn install_deps(project_root: &Path, package_lock: &str, max_concurren
 
     // Step 3: Download and install packages with concurrency control
     stream::iter(packages_to_download)
-        .map(|(name, version, tgz_url, integrity, shasum, path_key)| {
-            let project_root = project_root.to_path_buf();
-            async move {
-                install_package(&project_root, &name, &version, &tgz_url, integrity.as_deref(), shasum.as_deref(), &path_key).await
+        .map({_project_root = project_root.to_path_buf();
+            move |(name, version, tgz_url, integrity, shasum, path_key)| {
+                let project_root = _project_root.clone();
+                async move {
+                    install_package(&project_root, &name, &version, &tgz_url, integrity.as_deref(), shasum.as_deref(), &path_key).await
+                }
             }
         })
         .buffer_unordered(max_concurrent_downloads)
