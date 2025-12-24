@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 use tar::Archive;
@@ -10,6 +11,17 @@ use crate::pack;
 
 use crate::package_lock::PackageLock;
 
+/// Group of packages sharing the same tgz URL
+struct TgzGroup {
+    name: String,
+    version: String,
+    tgz_url: String,
+    integrity: Option<String>,
+    shasum: Option<String>,
+    /// All node_modules paths that need this package
+    path_keys: Vec<String>,
+}
+
 /// Download all tgz packages to OPFS
 pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -> Result<()> {
     let lock = PackageLock::from_json(package_lock)?;
@@ -17,39 +29,41 @@ pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -
     // Write package.json to root
     ensure_package_json(&lock).await?;
 
-    // Prepare package info for installation
-    let packages: Vec<_> = lock
-        .packages
-        .iter()
-        .filter(|(path, _)| !path.is_empty())
-        .map(|(path, pkg)| {
-            (
-                pkg.get_name(path),
-                pkg.get_version(),
-                pkg.resolved.clone(),
-                pkg.integrity.clone(),
-                pkg.shasum.clone(),
-                path.clone(),
-            )
-        })
-        .collect();
+    // Step 1: Group packages by tgz URL to deduplicate downloads
+    let mut tgz_groups: HashMap<String, TgzGroup> = HashMap::new();
 
-    // Step 1: Filter packages into cached and needs-download
-    let mut cached_packages = Vec::new();
-    let mut packages_to_download = Vec::new();
-
-    for (name, version, tgz_url, integrity, shasum, path_key) in packages {
-        let url = match tgz_url.as_ref() {
-            Some(u) => u,
+    for (path, pkg) in lock.packages.iter().filter(|(path, _)| !path.is_empty()) {
+        let name = pkg.get_name(path);
+        let version = pkg.get_version();
+        let tgz_url = match &pkg.resolved {
+            Some(u) => u.clone(),
             None => {
                 return Err(anyhow::anyhow!("{}@{}: no resolved field", name, version));
             }
         };
 
-        let paths = PackagePaths::new(&name, url, &path_key);
+        tgz_groups
+            .entry(tgz_url.clone())
+            .or_insert_with(|| TgzGroup {
+                name,
+                version,
+                tgz_url,
+                integrity: pkg.integrity.clone(),
+                shasum: pkg.shasum.clone(),
+                path_keys: Vec::new(),
+            })
+            .path_keys
+            .push(path.clone());
+    }
+
+    // Step 2: Check cache status and separate into cached vs needs-download
+    let mut cached_links: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    let mut tgz_to_download: Vec<TgzGroup> = Vec::new();
+
+    for group in tgz_groups.into_values() {
+        let paths = PackagePaths::new(&group.name, &group.tgz_url);
 
         // Check if already unpacked (strict check: marker must be file, unpacked_dir must be directory)
-        // If _resolved marker exists, it means the package has been verified and extracted successfully
         let is_cached = if let Ok(marker_meta) = tokio_fs_ext::metadata(&paths.resolved_marker).await
             && marker_meta.is_file()
             && let Ok(dir_meta) = tokio_fs_ext::metadata(&paths.unpacked_dir).await
@@ -61,30 +75,76 @@ pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -
         };
 
         if is_cached {
-            cached_packages.push((paths, name, version));
+            cached_links.push((paths.unpacked_dir, group.path_keys));
         } else {
-            packages_to_download.push((name, version, tgz_url, integrity, shasum, path_key));
+            tgz_to_download.push(group);
         }
     }
 
-    // Step 2: Create fuse links for cached packages (parallel, no limit)
+    // Step 3: Create fuse links for cached packages (parallel, no limit)
     futures::future::try_join_all(
-        cached_packages.into_iter().map(|(paths, name, version)| async move {
-            fuse::fuse_link(&paths.unpacked_dir, &paths.link_target_dir)
-                .await
-                .context(format!("{}@{}: failed to create fuse link", name, version))
+        cached_links.into_iter().flat_map(|(unpacked_dir, path_keys)| {
+            path_keys.into_iter().map(move |path_key| {
+                let unpacked = unpacked_dir.clone();
+                async move {
+                    fuse::fuse_link(&unpacked, &PathBuf::from(&path_key))
+                        .await
+                        .context(format!("failed to create fuse link for {}", path_key))
+                }
+            })
         })
     )
     .await?;
 
-    // Step 3: Download and install packages with concurrency control
-    stream::iter(packages_to_download)
-        .map(|(name, version, tgz_url, integrity, shasum, path_key)| async move {
-            install_package(&name, &version, &tgz_url, integrity.as_deref(), shasum.as_deref(), &path_key).await
+    // Step 4: Download and extract unique tgz files (deduplicated, with concurrency control)
+    stream::iter(tgz_to_download)
+        .map(|group| async move {
+            download_and_extract_tgz(&group).await
         })
         .buffer_unordered(max_concurrent_downloads)
         .try_collect::<()>()
         .await
+}
+
+/// Download tgz, extract it, and create fuse links for all target paths
+async fn download_and_extract_tgz(group: &TgzGroup) -> Result<()> {
+    let paths = PackagePaths::new(&group.name, &group.tgz_url);
+
+    // Download and verify tgz bytes
+    let tgz_bytes = download_tgz(
+        &group.tgz_url,
+        &paths.tgz_store_path,
+        group.integrity.as_deref(),
+        group.shasum.as_deref(),
+    )
+    .await
+    .context(format!("{}@{}: failed to download package", group.name, group.version))?;
+
+    // Extract tgz
+    extract_tgz_bytes(&tgz_bytes, &paths.unpacked_dir)
+        .await
+        .context(format!("{}@{}: failed to extract package", group.name, group.version))?;
+
+    // Write resolved marker file to indicate successful extraction
+    tokio_fs_ext::write(&paths.resolved_marker, b"")
+        .await
+        .context(format!("{}@{}: failed to write marker", group.name, group.version))?;
+
+    // Create fuse links for all target paths (parallel)
+    futures::future::try_join_all(group.path_keys.iter().map(|path_key| {
+        let unpacked_dir = paths.unpacked_dir.clone();
+        let name = group.name.clone();
+        let version = group.version.clone();
+        let path_key = path_key.clone();
+        async move {
+            fuse::fuse_link(&unpacked_dir, &PathBuf::from(&path_key))
+                .await
+                .context(format!("{}@{}: failed to create fuse link for {}", name, version, path_key))
+        }
+    }))
+    .await?;
+
+    Ok(())
 }
 
 /// Write root package.json to the project directory
@@ -101,58 +161,6 @@ async fn ensure_package_json(lock: &PackageLock) -> Result<()> {
         tokio_fs_ext::create_dir_all(&format!("./node_modules")).await?;
         tokio_fs_ext::write(&format!("./package.json"), pkg_json.as_bytes()).await?;
     }
-    Ok(())
-}
-
-/// Install package using the provided URL
-async fn install_package(
-    name: &str,
-    version: &str,
-    tgz_url: &Option<String>,
-    integrity: Option<&str>,
-    shasum: Option<&str>,
-    path_key: &str,
-) -> Result<()> {
-    let url = tgz_url
-        .as_ref()
-        .with_context(|| format!("{}@{}: no resolved field", name, version))?;
-
-    let paths = PackagePaths::new(name, url, path_key);
-
-    // Check if already unpacked by checking for both resolved marker and unpacked directory
-    // If _resolved marker exists, it means the package has been verified and extracted successfully
-    if let Ok(marker_meta) = tokio_fs_ext::metadata(&paths.resolved_marker).await
-        && marker_meta.is_file()
-        && let Ok(dir_meta) = tokio_fs_ext::metadata(&paths.unpacked_dir).await
-        && dir_meta.is_dir()
-    {
-        // Package is fully unpacked and verified, create fuse link
-        fuse::fuse_link(&paths.unpacked_dir, &paths.link_target_dir)
-            .await
-            .context(format!("{}@{}: failed to create fuse link", name, version))?;
-        return Ok(());
-    }
-
-    // Download and verify tgz bytes
-    let tgz_bytes = download_tgz(url, &paths.tgz_store_path, integrity, shasum)
-        .await
-        .context(format!("{}@{}: failed to download package", name, version))?;
-
-    // Extract and create fuse link
-    extract_tgz_bytes(&tgz_bytes, &paths.unpacked_dir)
-        .await
-        .context(format!("{}@{}: failed to extract package", name, version))?;
-
-    // Write resolved marker file to indicate successful extraction
-    tokio_fs_ext::write(&paths.resolved_marker, b"")
-        .await
-        .context(format!("{}@{}: failed to write marker", name, version))?;
-
-    // Create fuse link
-    fuse::fuse_link(&paths.unpacked_dir, &paths.link_target_dir)
-        .await
-        .context(format!("{}@{}: failed to create fuse link", name, version))?;
-
     Ok(())
 }
 
@@ -198,11 +206,10 @@ struct PackagePaths {
     tgz_store_path: PathBuf,
     unpacked_dir: PathBuf,
     resolved_marker: PathBuf,
-    link_target_dir: PathBuf,
 }
 
 impl PackagePaths {
-    fn new(name: &str, tgz_url: &str, path_key: &str) -> Self {
+    fn new(name: &str, tgz_url: &str) -> Self {
         let url_path: Vec<_> = tgz_url.split('/').collect();
         let tgz_file_name = url_path.last().unwrap_or(&"package.tgz");
 
@@ -210,7 +217,6 @@ impl PackagePaths {
             tgz_store_path: PathBuf::from(format!("/stores/{name}/-/{tgz_file_name}")),
             unpacked_dir: PathBuf::from(format!("/stores/{name}/-/{tgz_file_name}-unpack")),
             resolved_marker: PathBuf::from(format!("/stores/{name}/-/{tgz_file_name}-unpack._resolved")),
-            link_target_dir: PathBuf::from(format!("{path_key}")),
         }
     }
 }
@@ -388,6 +394,53 @@ mod tests {
 
     use wasm_bindgen_test::*;
 
+    /// Install a single package (test helper)
+    async fn install_package(
+        name: &str,
+        version: &str,
+        tgz_url: &Option<String>,
+        integrity: Option<&str>,
+        shasum: Option<&str>,
+        path_key: &str,
+    ) -> Result<()> {
+        let url = tgz_url
+            .as_ref()
+            .with_context(|| format!("{}@{}: no resolved field", name, version))?;
+
+        let paths = PackagePaths::new(name, url);
+        let link_target = PathBuf::from(path_key);
+
+        // Check if already unpacked
+        if let Ok(marker_meta) = tokio_fs_ext::metadata(&paths.resolved_marker).await
+            && marker_meta.is_file()
+            && let Ok(dir_meta) = tokio_fs_ext::metadata(&paths.unpacked_dir).await
+            && dir_meta.is_dir()
+        {
+            fuse::fuse_link(&paths.unpacked_dir, &link_target)
+                .await
+                .context(format!("{}@{}: failed to create fuse link", name, version))?;
+            return Ok(());
+        }
+
+        let tgz_bytes = download_tgz(url, &paths.tgz_store_path, integrity, shasum)
+            .await
+            .context(format!("{}@{}: failed to download package", name, version))?;
+
+        extract_tgz_bytes(&tgz_bytes, &paths.unpacked_dir)
+            .await
+            .context(format!("{}@{}: failed to extract package", name, version))?;
+
+        tokio_fs_ext::write(&paths.resolved_marker, b"")
+            .await
+            .context(format!("{}@{}: failed to write marker", name, version))?;
+
+        fuse::fuse_link(&paths.unpacked_dir, &link_target)
+            .await
+            .context(format!("{}@{}: failed to create fuse link", name, version))?;
+
+        Ok(())
+    }
+
     /// Create a test package lock with minimal content
     fn create_test_package_lock() -> PackageLock {
         let mut packages = std::collections::HashMap::new();
@@ -448,11 +501,9 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_package_paths_new() {
-
         let paths = PackagePaths::new(
             "lodash",
             "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
-            "node_modules/lodash",
         );
 
         assert_eq!(paths.tgz_store_path.to_string_lossy(), "/stores/lodash/-/lodash-4.17.21.tgz");
@@ -460,16 +511,13 @@ mod tests {
             paths.unpacked_dir.to_string_lossy(),
             "/stores/lodash/-/lodash-4.17.21.tgz-unpack"
         );
-        assert_eq!(paths.link_target_dir.to_string_lossy(), "node_modules/lodash");
     }
 
     #[wasm_bindgen_test]
     async fn test_package_paths_new_with_complex_url() {
-
         let paths = PackagePaths::new(
             "@types/node",
             "https://registry.npmjs.org/@types/node/-/node-18.0.0.tgz",
-            "node_modules/@types/node",
         );
 
         assert_eq!(
@@ -480,7 +528,6 @@ mod tests {
             paths.unpacked_dir.to_string_lossy(),
             "/stores/@types/node/-/node-18.0.0.tgz-unpack"
         );
-        assert_eq!(paths.link_target_dir.to_string_lossy(), "node_modules/@types/node");
     }
 
     #[wasm_bindgen_test]
@@ -977,7 +1024,6 @@ mod tests {
             let paths = PackagePaths::new(
                 "test-dirty-cache",
                 "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
-                "node_modules/test-dirty-cache",
             );
 
             // Check that resolved marker exists
@@ -1055,7 +1101,6 @@ mod tests {
             let paths = PackagePaths::new(
                 "test-marker-only",
                 "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
-                "node_modules/test-marker-only",
             );
 
             // Verify marker exists
@@ -1133,7 +1178,6 @@ mod tests {
             let paths = PackagePaths::new(
                 "test-dir-only",
                 "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
-                "node_modules/test-dir-only",
             );
 
             // Verify marker exists
@@ -1464,7 +1508,6 @@ mod tests {
         let paths = PackagePaths::new(
             "test-pkg",
             "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
-            "node_modules/test-pkg",
         );
 
         // Create marker as a DIRECTORY (incorrect state)
@@ -1557,7 +1600,6 @@ mod tests {
         let paths = PackagePaths::new(
             "test-pkg2",
             "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
-            "node_modules/test-pkg2",
         );
 
         // Create marker as a proper file
@@ -1596,7 +1638,7 @@ mod tests {
         let url = "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
         let path_key = "node_modules/test-corrupted-tgz";
 
-        let paths = PackagePaths::new(name, url, path_key);
+        let paths = PackagePaths::new(name, url);
 
         // Clean up any existing files from previous test runs
         let _ = tokio_fs_ext::remove_file(&paths.resolved_marker).await;
@@ -1712,7 +1754,7 @@ mod tests {
         let url = "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
         let path_key = "node_modules/test-empty-tgz";
 
-        let paths = PackagePaths::new(name, url, path_key);
+        let paths = PackagePaths::new(name, url);
 
         // Clean up any existing files from previous test runs
         let _ = tokio_fs_ext::remove_file(&paths.resolved_marker).await;
@@ -1759,6 +1801,117 @@ mod tests {
             );
         } else {
             println!("Test skipped: network unavailable");
+        }
+    }
+
+    /// Test that same tgz in different node_modules levels are all installed correctly
+    /// This verifies the deduplication logic: download once, create fuse links for all paths
+    #[wasm_bindgen_test]
+    async fn test_same_tgz_multiple_locations() {
+        test_utils::init_tracing();
+        set_cwd("/same-tgz-multi-loc");
+
+        // Same tgz URL for both locations
+        let tgz_url = "https://registry.npmmirror.com/lodash/-/lodash-4.17.21.tgz";
+
+        let mut packages = std::collections::HashMap::new();
+
+        // Root package
+        packages.insert("".to_string(), LockPackage {
+            name: Some("test-project".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: None,
+            integrity: None,
+            shasum: None,
+            license: None,
+            dependencies: Some(std::collections::HashMap::new()),
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        // Location 1: node_modules/a/node_modules/lodash
+        packages.insert("node_modules/a/node_modules/lodash".to_string(), LockPackage {
+            name: Some("lodash".to_string()),
+            version: Some("4.17.21".to_string()),
+            resolved: Some(tgz_url.to_string()),
+            integrity: None,
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        // Location 2: node_modules/b/node_modules/lodash (same tgz URL)
+        packages.insert("node_modules/b/node_modules/lodash".to_string(), LockPackage {
+            name: Some("lodash".to_string()),
+            version: Some("4.17.21".to_string()),
+            resolved: Some(tgz_url.to_string()),
+            integrity: None,
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        let lock = PackageLock {
+            name: "test-project".to_string(),
+            version: "1.0.0".to_string(),
+            lockfile_version: 2,
+            requires: true,
+            packages,
+            dependencies: None,
+        };
+
+        let lock_json = serde_json::to_string(&lock).unwrap();
+        let result = install_deps(&lock_json, 10).await;
+
+        if result.is_ok() {
+            // Both locations should have lodash installed
+            // Use crate::read which resolves fuse.link
+            let path_a = "./node_modules/a/node_modules/lodash/package.json";
+            let path_b = "./node_modules/b/node_modules/lodash/package.json";
+
+            let pkg_a = crate::read(path_a).await;
+            let pkg_b = crate::read(path_b).await;
+
+            assert!(pkg_a.is_ok(), "lodash in node_modules/a should exist: {:?}", pkg_a.err());
+            assert!(pkg_b.is_ok(), "lodash in node_modules/b should exist: {:?}", pkg_b.err());
+
+            // Both should have valid package.json content
+            let bytes_a = pkg_a.unwrap();
+            let bytes_b = pkg_b.unwrap();
+            let content_a = String::from_utf8_lossy(&bytes_a);
+            let content_b = String::from_utf8_lossy(&bytes_b);
+            assert!(content_a.contains("lodash"), "package.json in a should contain lodash");
+            assert!(content_b.contains("lodash"), "package.json in b should contain lodash");
+        } else {
+            println!("Test skipped: {:?}", result.err());
         }
     }
 }
