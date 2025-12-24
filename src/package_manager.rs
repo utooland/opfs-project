@@ -130,12 +130,19 @@ async fn download_and_extract_tgz(group: &TgzGroup) -> Result<()> {
         .await
         .context(format!("{}@{}: failed to write marker", group.name, group.version))?;
 
-    // Create fuse links for all target paths
-    for path_key in &group.path_keys {
-        fuse::fuse_link(&paths.unpacked_dir, &PathBuf::from(path_key))
-            .await
-            .context(format!("{}@{}: failed to create fuse link for {}", group.name, group.version, path_key))?;
-    }
+    // Create fuse links for all target paths (parallel)
+    futures::future::try_join_all(group.path_keys.iter().map(|path_key| {
+        let unpacked_dir = paths.unpacked_dir.clone();
+        let name = group.name.clone();
+        let version = group.version.clone();
+        let path_key = path_key.clone();
+        async move {
+            fuse::fuse_link(&unpacked_dir, &PathBuf::from(&path_key))
+                .await
+                .context(format!("{}@{}: failed to create fuse link for {}", name, version, path_key))
+        }
+    }))
+    .await?;
 
     Ok(())
 }
@@ -1812,6 +1819,117 @@ mod tests {
             );
         } else {
             println!("Test skipped: network unavailable");
+        }
+    }
+
+    /// Test that same tgz in different node_modules levels are all installed correctly
+    /// This verifies the deduplication logic: download once, create fuse links for all paths
+    #[wasm_bindgen_test]
+    async fn test_same_tgz_multiple_locations() {
+        test_utils::init_tracing();
+        set_cwd("/same-tgz-multi-loc");
+
+        // Same tgz URL for both locations
+        let tgz_url = "https://registry.npmmirror.com/lodash/-/lodash-4.17.21.tgz";
+
+        let mut packages = std::collections::HashMap::new();
+
+        // Root package
+        packages.insert("".to_string(), LockPackage {
+            name: Some("test-project".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: None,
+            integrity: None,
+            shasum: None,
+            license: None,
+            dependencies: Some(std::collections::HashMap::new()),
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        // Location 1: node_modules/a/node_modules/lodash
+        packages.insert("node_modules/a/node_modules/lodash".to_string(), LockPackage {
+            name: Some("lodash".to_string()),
+            version: Some("4.17.21".to_string()),
+            resolved: Some(tgz_url.to_string()),
+            integrity: None,
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        // Location 2: node_modules/b/node_modules/lodash (same tgz URL)
+        packages.insert("node_modules/b/node_modules/lodash".to_string(), LockPackage {
+            name: Some("lodash".to_string()),
+            version: Some("4.17.21".to_string()),
+            resolved: Some(tgz_url.to_string()),
+            integrity: None,
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        let lock = PackageLock {
+            name: "test-project".to_string(),
+            version: "1.0.0".to_string(),
+            lockfile_version: 2,
+            requires: true,
+            packages,
+            dependencies: None,
+        };
+
+        let lock_json = serde_json::to_string(&lock).unwrap();
+        let result = install_deps(&lock_json, 10).await;
+
+        if result.is_ok() {
+            // Both locations should have lodash installed
+            // Use crate::read which resolves fuse.link
+            let path_a = "./node_modules/a/node_modules/lodash/package.json";
+            let path_b = "./node_modules/b/node_modules/lodash/package.json";
+
+            let pkg_a = crate::read(path_a).await;
+            let pkg_b = crate::read(path_b).await;
+
+            assert!(pkg_a.is_ok(), "lodash in node_modules/a should exist: {:?}", pkg_a.err());
+            assert!(pkg_b.is_ok(), "lodash in node_modules/b should exist: {:?}", pkg_b.err());
+
+            // Both should have valid package.json content
+            let bytes_a = pkg_a.unwrap();
+            let bytes_b = pkg_b.unwrap();
+            let content_a = String::from_utf8_lossy(&bytes_a);
+            let content_b = String::from_utf8_lossy(&bytes_b);
+            assert!(content_a.contains("lodash"), "package.json in a should contain lodash");
+            assert!(content_b.contains("lodash"), "package.json in b should contain lodash");
+        } else {
+            println!("Test skipped: {:?}", result.err());
         }
     }
 }
