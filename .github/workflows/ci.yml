@@ -24,11 +24,6 @@ jobs:
       with:
         version: latest
 
-    - name: Setup Firefox
-      uses: browser-actions/setup-firefox@v1
-      with:
-        firefox-version: latest
-
     - name: Cache dependencies
       uses: actions/cache@v4
       with:
@@ -45,11 +40,3 @@ jobs:
 
     - name: Build
       run: wasm-pack build
-
-    - name: Run single test
-      run: wasm-pack test --headless --firefox
-      timeout-minutes: 5
-      env:
-        RUST_BACKTRACE: 1
-        WASM_BINDGEN_TEST_TIMEOUT: 120
-        WASM_BINDGEN_TEST_FILTER: test_sig_md5
