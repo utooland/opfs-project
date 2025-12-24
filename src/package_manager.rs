@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 use tar::Archive;
@@ -10,6 +11,17 @@ use crate::pack;
 
 use crate::package_lock::PackageLock;
 
+/// Group of packages sharing the same tgz URL
+struct TgzGroup {
+    name: String,
+    version: String,
+    tgz_url: String,
+    integrity: Option<String>,
+    shasum: Option<String>,
+    /// All node_modules paths that need this package
+    path_keys: Vec<String>,
+}
+
 /// Download all tgz packages to OPFS
 pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -> Result<()> {
     let lock = PackageLock::from_json(package_lock)?;
@@ -17,39 +29,41 @@ pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -
     // Write package.json to root
     ensure_package_json(&lock).await?;
 
-    // Prepare package info for installation
-    let packages: Vec<_> = lock
-        .packages
-        .iter()
-        .filter(|(path, _)| !path.is_empty())
-        .map(|(path, pkg)| {
-            (
-                pkg.get_name(path),
-                pkg.get_version(),
-                pkg.resolved.clone(),
-                pkg.integrity.clone(),
-                pkg.shasum.clone(),
-                path.clone(),
-            )
-        })
-        .collect();
+    // Step 1: Group packages by tgz URL to deduplicate downloads
+    let mut tgz_groups: HashMap<String, TgzGroup> = HashMap::new();
 
-    // Step 1: Filter packages into cached and needs-download
-    let mut cached_packages = Vec::new();
-    let mut packages_to_download = Vec::new();
-
-    for (name, version, tgz_url, integrity, shasum, path_key) in packages {
-        let url = match tgz_url.as_ref() {
-            Some(u) => u,
+    for (path, pkg) in lock.packages.iter().filter(|(path, _)| !path.is_empty()) {
+        let name = pkg.get_name(path);
+        let version = pkg.get_version();
+        let tgz_url = match &pkg.resolved {
+            Some(u) => u.clone(),
             None => {
                 return Err(anyhow::anyhow!("{}@{}: no resolved field", name, version));
             }
         };
 
-        let paths = PackagePaths::new(&name, url, &path_key);
+        tgz_groups
+            .entry(tgz_url.clone())
+            .or_insert_with(|| TgzGroup {
+                name,
+                version,
+                tgz_url,
+                integrity: pkg.integrity.clone(),
+                shasum: pkg.shasum.clone(),
+                path_keys: Vec::new(),
+            })
+            .path_keys
+            .push(path.clone());
+    }
+
+    // Step 2: Check cache status and separate into cached vs needs-download
+    let mut cached_links: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    let mut tgz_to_download: Vec<TgzGroup> = Vec::new();
+
+    for group in tgz_groups.into_values() {
+        let paths = PackagePaths::new(&group.name, &group.tgz_url, &group.path_keys[0]);
 
         // Check if already unpacked (strict check: marker must be file, unpacked_dir must be directory)
-        // If _resolved marker exists, it means the package has been verified and extracted successfully
         let is_cached = if let Ok(marker_meta) = tokio_fs_ext::metadata(&paths.resolved_marker).await
             && marker_meta.is_file()
             && let Ok(dir_meta) = tokio_fs_ext::metadata(&paths.unpacked_dir).await
@@ -61,30 +75,69 @@ pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -
         };
 
         if is_cached {
-            cached_packages.push((paths, name, version));
+            cached_links.push((paths.unpacked_dir, group.path_keys));
         } else {
-            packages_to_download.push((name, version, tgz_url, integrity, shasum, path_key));
+            tgz_to_download.push(group);
         }
     }
 
-    // Step 2: Create fuse links for cached packages (parallel, no limit)
+    // Step 3: Create fuse links for cached packages (parallel, no limit)
     futures::future::try_join_all(
-        cached_packages.into_iter().map(|(paths, name, version)| async move {
-            fuse::fuse_link(&paths.unpacked_dir, &paths.link_target_dir)
-                .await
-                .context(format!("{}@{}: failed to create fuse link", name, version))
+        cached_links.into_iter().flat_map(|(unpacked_dir, path_keys)| {
+            path_keys.into_iter().map(move |path_key| {
+                let unpacked = unpacked_dir.clone();
+                async move {
+                    fuse::fuse_link(&unpacked, &PathBuf::from(&path_key))
+                        .await
+                        .context(format!("failed to create fuse link for {}", path_key))
+                }
+            })
         })
     )
     .await?;
 
-    // Step 3: Download and install packages with concurrency control
-    stream::iter(packages_to_download)
-        .map(|(name, version, tgz_url, integrity, shasum, path_key)| async move {
-            install_package(&name, &version, &tgz_url, integrity.as_deref(), shasum.as_deref(), &path_key).await
+    // Step 4: Download and extract unique tgz files (deduplicated, with concurrency control)
+    stream::iter(tgz_to_download)
+        .map(|group| async move {
+            download_and_extract_tgz(&group).await
         })
         .buffer_unordered(max_concurrent_downloads)
         .try_collect::<()>()
         .await
+}
+
+/// Download tgz, extract it, and create fuse links for all target paths
+async fn download_and_extract_tgz(group: &TgzGroup) -> Result<()> {
+    let paths = PackagePaths::new(&group.name, &group.tgz_url, &group.path_keys[0]);
+
+    // Download and verify tgz bytes
+    let tgz_bytes = download_tgz(
+        &group.tgz_url,
+        &paths.tgz_store_path,
+        group.integrity.as_deref(),
+        group.shasum.as_deref(),
+    )
+    .await
+    .context(format!("{}@{}: failed to download package", group.name, group.version))?;
+
+    // Extract tgz
+    extract_tgz_bytes(&tgz_bytes, &paths.unpacked_dir)
+        .await
+        .context(format!("{}@{}: failed to extract package", group.name, group.version))?;
+
+    // Write resolved marker file to indicate successful extraction
+    tokio_fs_ext::write(&paths.resolved_marker, b"")
+        .await
+        .context(format!("{}@{}: failed to write marker", group.name, group.version))?;
+
+    // Create fuse links for all target paths
+    for path_key in &group.path_keys {
+        fuse::fuse_link(&paths.unpacked_dir, &PathBuf::from(path_key))
+            .await
+            .context(format!("{}@{}: failed to create fuse link for {}", group.name, group.version, path_key))?;
+    }
+
+    Ok(())
 }
 
 /// Write root package.json to the project directory
