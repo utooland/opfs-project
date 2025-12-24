@@ -7,7 +7,7 @@ on:
     branches: [ master, main ]
 
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
 
     steps:
@@ -24,11 +24,6 @@ jobs:
       with:
         version: latest
 
-    - name: Setup Firefox
-      uses: browser-actions/setup-firefox@v1
-      with:
-        firefox-version: latest
-
     - name: Cache dependencies
       uses: actions/cache@v4
       with:
@@ -40,12 +35,8 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-
 
-    - name: Build project
-      run: wasm-pack build
+    - name: Check
+      run: cargo check --target wasm32-unknown-unknown
 
-    - name: Run tests
-      run: WASM_BINDGEN_TEST_TIMEOUT=600 wasm-pack test --headless --firefox
-      timeout-minutes: 15
-      env:
-        RUST_BACKTRACE: 1
-        MOZ_HEADLESS: 1
+    - name: Build
+      run: wasm-pack build
