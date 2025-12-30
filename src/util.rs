@@ -128,7 +128,7 @@ mod tests {
 
         let file_names: Vec<String> = entries
             .iter()
-            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
 
         // Check for files
@@ -140,10 +140,10 @@ mod tests {
 
         // Verify file types
         for entry in &entries {
-            if let Some(name) = entry.file_name().to_str() {
-                match name {
-                    "file1.txt" | "file2.js" => {
-                        let meta = tokio_fs_ext::metadata(entry.path()).await.unwrap();
+            let name = entry.file_name().to_string_lossy();
+            match name.as_ref() {
+                "file1.txt" | "file2.js" => {
+                    let meta = tokio_fs_ext::metadata(entry.path()).await.unwrap();
                         assert!(!meta.is_dir());
                     }
                     "subdir" => {

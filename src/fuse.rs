@@ -3,6 +3,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::sync::{RwLock, LazyLock};
+use std::borrow::Cow;
 
 use crate::util::read_dir_direct;
 use tracing::{info, error};
@@ -48,11 +49,11 @@ pub async fn fuse_link<S: AsRef<Path>, D: AsRef<Path>>(src: S, dst: D) -> Result
 // ./node_modules/c/node_modules/d/types.js -> ./node_modules/c/node_modules/d/fuse.link
 fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<std::path::PathBuf> {
     let mut current = path.as_ref();
-    let mut temp = ("", "");
+    let mut temp: (Cow<str>, Cow<str>) = (Cow::Borrowed(""), Cow::Borrowed(""));
     // Walk up the path tree to find node_modules
     while let Some(parent) = current.parent() {
         if let Some(file_name) = current.file_name() {
-            let name = file_name.to_str()?;
+            let name = file_name.to_string_lossy();
 
             // Update temp tuple: shift components and add new one
             temp = (name, temp.0);
@@ -70,18 +71,18 @@ fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<std::path::PathBuf> {
                                 info!("Found scope directory, not a package: {}", temp.0);
                             } else {
                                 // Single component package (like 'lodash')
-                                let fuse_path = parent.join(temp.0).join("fuse.link");
+                                let fuse_path = parent.join(temp.0.as_ref()).join("fuse.link");
                                 info!("Found fuse.link path for single component: {}", fuse_path.display());
                                 return Some(fuse_path);
                             }
                         } else {
                             // Two component package (could be scope/package or package/subpath)
                             if temp.0.starts_with('@') {
-                                let fuse_path = parent.join(temp.0).join(temp.1).join("fuse.link");
+                                let fuse_path = parent.join(temp.0.as_ref()).join(temp.1.as_ref()).join("fuse.link");
                                 info!("Found fuse.link path for scoped package: {}", fuse_path.display());
                                 return Some(fuse_path);
                             } else {
-                                let fuse_path = parent.join(temp.0).join("fuse.link");
+                                let fuse_path = parent.join(temp.0.as_ref()).join("fuse.link");
                                 info!("Found fuse.link path for package with subpath: {}", fuse_path.display());
                                 return Some(fuse_path);
                             }
@@ -264,11 +265,8 @@ pub(super) async fn try_read_dir_through_fuse_link<P: AsRef<Path> + std::fmt::De
     let filtered_original: Vec<_> = original_entries
         .into_iter()
         .filter(|entry| {
-            if let Some(file_name) = entry.file_name().to_str() {
-                file_name != "fuse.link"
-            } else {
-                true
-            }
+            let file_name = entry.file_name().to_string_lossy();
+            file_name != "fuse.link"
         })
         .collect();
 
