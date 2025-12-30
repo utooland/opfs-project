@@ -362,10 +362,8 @@ fn calculate_output_path(
 /// Write bytes to file
 async fn save_tgz(path: &PathBuf, bytes: &[u8]) -> Result<()> {
     // Create parent directory if it doesn't exist
-    if let Some(parent_dir) = path.parent()
-        && let Some(parent_str) = parent_dir.to_str()
-    {
-        tokio_fs_ext::create_dir_all(parent_str).await?;
+    if let Some(parent_dir) = path.parent() {
+        tokio_fs_ext::create_dir_all(parent_dir).await?;
     }
     tokio_fs_ext::write(path, bytes).await?;
     Ok(())
@@ -546,7 +544,7 @@ mod tests {
         let entries = crate::read_dir(&extract_dir).await.unwrap();
         let file_names: Vec<String> = entries
             .iter()
-            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
 
         assert!(file_names.contains(&"package.json".to_string()));
@@ -569,7 +567,7 @@ mod tests {
         let entries = crate::read_dir(&extract_dir).await.unwrap();
         let file_names: Vec<String> = entries
             .iter()
-            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
 
         assert!(file_names.contains(&"package.json".to_string()));
@@ -577,12 +575,12 @@ mod tests {
         assert!(!file_names.contains(&"package".to_string()));
 
         // Check that src is a directory and contains main.js
-        let src_entries = crate::read_dir(&format!("{}/src", extract_dir.to_string_lossy()))
+        let src_entries = crate::read_dir(extract_dir.join("src"))
             .await
             .unwrap();
         let src_file_names: Vec<String> = src_entries
             .iter()
-            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert!(src_file_names.contains(&"main.js".to_string()));
     }
@@ -642,11 +640,11 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify package.json was created
-        let package_json_exists = tokio_fs_ext::metadata(&format!("/{}/package.json", project_name.to_string_lossy())).await.is_ok();
+        let package_json_exists = tokio_fs_ext::metadata(project_name.join("package.json")).await.is_ok();
         assert!(package_json_exists);
 
         // Verify node_modules directory was created
-        let node_modules_exists = tokio_fs_ext::metadata(&format!("/{}/node_modules", project_name.to_string_lossy())).await.is_ok();
+        let node_modules_exists = tokio_fs_ext::metadata(project_name.join("node_modules")).await.is_ok();
         assert!(node_modules_exists);
     }
 
@@ -657,7 +655,7 @@ mod tests {
         tokio_fs_ext::create_dir_all(&project_name).await.unwrap();
 
         // Create existing package.json
-        tokio_fs_ext::write(&format!("{}/package.json", project_name.to_string_lossy()), "{}")
+        tokio_fs_ext::write(project_name.join("package.json"), "{}")
             .await
             .unwrap();
 
@@ -667,7 +665,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify existing package.json was not overwritten
-        let content = crate::read(&format!("{}/package.json", project_name.to_string_lossy())).await.unwrap();
+        let content = crate::read(project_name.join("package.json")).await.unwrap();
         let content_str = String::from_utf8(content).unwrap();
         assert_eq!(content_str, "{}");
     }
@@ -969,7 +967,7 @@ mod tests {
         let lodash_entries = crate::read_dir("./node_modules/lodash").await.unwrap();
         let lodash_names: Vec<String> = lodash_entries
             .iter()
-            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
 
         // Should contain node_modules (for lodash.has) and package content
@@ -980,7 +978,7 @@ mod tests {
         let lodash_has_entries = crate::read_dir("./node_modules/lodash/node_modules/lodash.has").await.unwrap();
         let lodash_has_names: Vec<String> = lodash_has_entries
             .iter()
-            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         println!("Lodash.has directory entries: {:?}", lodash_has_names);
 
@@ -992,7 +990,7 @@ mod tests {
         let deep_strict_entries = crate::read_dir("./node_modules/lodash/node_modules/lodash.has/node_modules/deep-strict").await.unwrap();
         let deep_strict_names: Vec<String> = deep_strict_entries
             .iter()
-            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         println!("Deep-strict directory entries: {:?}", deep_strict_names);
 

@@ -4,13 +4,12 @@ use std::path::Path;
 /// Prepare path by resolving relative paths against current working directory
 pub fn prepare_path<P: AsRef<Path>>(path: P) -> std::path::PathBuf {
     let path_ref = path.as_ref();
-    let path_str = path_ref.to_string_lossy();
 
-    if path_str.starts_with('/') {
-        std::path::PathBuf::from(path_str.as_ref())
-    } else if path_str.starts_with("./") {
+    if path_ref.starts_with("/") {
+        path_ref.to_path_buf()
+    } else if let Ok(stripped) = path_ref.strip_prefix(".") {
         let cwd = crate::get_cwd();
-        cwd.join(path_ref.strip_prefix("./").unwrap())
+        cwd.join(stripped)
     } else {
         let cwd = crate::get_cwd();
         cwd.join(path_ref)
@@ -128,7 +127,7 @@ mod tests {
 
         let file_names: Vec<String> = entries
             .iter()
-            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
 
         // Check for files
@@ -140,18 +139,16 @@ mod tests {
 
         // Verify file types
         for entry in &entries {
-            if let Some(name) = entry.file_name().to_str() {
-                match name {
-                    "file1.txt" | "file2.js" => {
-                        let meta = tokio_fs_ext::metadata(entry.path()).await.unwrap();
-                        assert!(!meta.is_dir());
-                    }
-                    "subdir" => {
-                        let meta = tokio_fs_ext::metadata(entry.path()).await.unwrap();
-                        assert!(meta.is_dir());
-                    }
-                    _ => {}
+            match entry.file_name().to_string_lossy().as_ref() {
+                "file1.txt" | "file2.js" => {
+                    let meta = tokio_fs_ext::metadata(entry.path()).await.unwrap();
+                    assert!(!meta.is_dir());
                 }
+                "subdir" => {
+                    let meta = tokio_fs_ext::metadata(entry.path()).await.unwrap();
+                    assert!(meta.is_dir());
+                }
+                _ => {}
             }
         }
     }
