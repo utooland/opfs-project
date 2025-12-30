@@ -265,8 +265,7 @@ pub(super) async fn try_read_dir_through_fuse_link<P: AsRef<Path> + std::fmt::De
     let filtered_original: Vec<_> = original_entries
         .into_iter()
         .filter(|entry| {
-            let file_name = entry.file_name().to_string_lossy();
-            file_name != "fuse.link"
+            entry.file_name().to_string_lossy() != "fuse.link"
         })
         .collect();
 

@@ -15,7 +15,7 @@ exclude = [".gitignore", ".github/", "target/", "pkg/"]
 
 [dependencies]
 serde = { version = "1.0.219", features = ["derive"] }
-flate2 = { version = "1.1.5", features = ["zlib-rs"], default-features = false }
+flate2 = { version = "1.1.5", features = ["miniz_oxide", "rust_backend"], default-features = false }
 tar = "0.4.44"
 futures = "0.3.31"
 futures-util = "0.3.31"

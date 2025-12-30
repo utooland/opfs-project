@@ -140,18 +140,16 @@ mod tests {
 
         // Verify file types
         for entry in &entries {
-            let name = entry.file_name().to_string_lossy();
-            match name.as_ref() {
+            match entry.file_name().to_string_lossy().as_ref() {
                 "file1.txt" | "file2.js" => {
                     let meta = tokio_fs_ext::metadata(entry.path()).await.unwrap();
-                        assert!(!meta.is_dir());
-                    }
-                    "subdir" => {
-                        let meta = tokio_fs_ext::metadata(entry.path()).await.unwrap();
-                        assert!(meta.is_dir());
-                    }
-                    _ => {}
+                    assert!(!meta.is_dir());
                 }
+                "subdir" => {
+                    let meta = tokio_fs_ext::metadata(entry.path()).await.unwrap();
+                    assert!(meta.is_dir());
+                }
+                _ => {}
             }
         }
     }
