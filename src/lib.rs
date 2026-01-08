@@ -15,9 +15,7 @@ mod util;
 
 pub use tokio_fs_ext::DirEntry;
 
-// Re-export fuse link functions for lazy extraction
-pub use fuse::fuse_link_with_prefix;
-pub use package_manager::{PublicPackagePaths, is_tgz_cached, download_only, create_fuse_links_lazy};
+pub use package_manager::install;
 
 /// Read file content with fuse.link support
 pub async fn read<P: AsRef<Path>>(path: P) -> Result<Arc<Vec<u8>>> {
