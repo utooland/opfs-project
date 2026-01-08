@@ -174,23 +174,17 @@ pub async fn install(lock: &PackageLock, max_concurrent_downloads: Option<usize>
     if !to_download.is_empty() {
         let max_concurrent = max_concurrent_downloads.unwrap_or(DEFAULT_MAX_CONCURRENT_DOWNLOADS);
 
-        let download_results: Vec<_> = stream::iter(to_download.iter().map(|group| {
-            let name = group.name.clone();
-            let version = group.version.clone();
-            let tgz_url = group.tgz_url.clone();
-            let integrity = group.integrity.clone();
-            let shasum = group.shasum.clone();
-
+        let download_results: Vec<_> = stream::iter(to_download.into_iter().map(|group| {
             async move {
                 let _bytes = download_only(
-                    &name,
-                    &version,
-                    &tgz_url,
-                    integrity.as_deref(),
-                    shasum.as_deref(),
+                    &group.name,
+                    &group.version,
+                    &group.tgz_url,
+                    group.integrity.as_deref(),
+                    group.shasum.as_deref(),
                 )
                 .await?;
-                Ok::<(String, String), anyhow::Error>((name, tgz_url))
+                Ok::<_, anyhow::Error>((group.name, group.tgz_url, group.target_paths))
             }
         }))
         .buffer_unordered(max_concurrent)
@@ -198,10 +192,10 @@ pub async fn install(lock: &PackageLock, max_concurrent_downloads: Option<usize>
         .await;
 
         // Create lazy fuse links for downloaded packages
-        for (result, group) in download_results.into_iter().zip(to_download.into_iter()) {
-            let (name, tgz_url) = result?;
+        for result in download_results {
+            let (name, tgz_url, target_paths) = result?;
             let paths = PublicPackagePaths::new(&name, &tgz_url);
-            create_fuse_links_lazy(&paths.tgz_store_path, &group.target_paths, Some("package"))
+            create_fuse_links_lazy(&paths.tgz_store_path, &target_paths, Some("package"))
                 .await?;
         }
     }
