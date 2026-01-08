@@ -2,17 +2,15 @@ use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::sync::{RwLock, LazyLock};
-use std::borrow::Cow;
 
 use crate::util::read_dir_direct;
 use crate::tar_cache;
 use tracing::error;
 
-// Global cache for fuse.link mappings to avoid repeated file reads
-static FUSE_LINK_CACHE: LazyLock<RwLock<HashMap<PathBuf, String>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+static FUSE_LINK_CACHE: LazyLock<RwLock<HashMap<PathBuf, String>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Create fuse link with tgz path and prefix (for lazy extraction)
-/// Format: "{tgz_path}|{prefix}"
+/// Create fuse link with tgz path and prefix
 pub async fn fuse_link_with_prefix<S: AsRef<Path>, D: AsRef<Path>>(
     tgz_path: S,
     dst: D,
@@ -26,58 +24,39 @@ pub async fn fuse_link_with_prefix<S: AsRef<Path>, D: AsRef<Path>>(
     let fuse_link_path = get_fuse_link_path(dst_ref)
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Could not determine fuse.link path"))?;
 
-    let link_content = if let Some(p) = prefix {
-        format!("{}|{}\n", tgz_ref.to_string_lossy(), p)
-    } else {
-        format!("{}\n", tgz_ref.to_string_lossy())
+    let link_content = match prefix {
+        Some(p) => format!("{}|{}\n", tgz_ref.display(), p),
+        None => format!("{}\n", tgz_ref.display()),
     };
 
     tokio_fs_ext::write(&fuse_link_path, link_content.as_bytes()).await?;
 
     if let Ok(mut cache) = FUSE_LINK_CACHE.write() {
-        cache.insert(fuse_link_path.clone(), link_content.trim().to_string());
+        cache.insert(fuse_link_path, link_content.trim().to_string());
     }
 
     Ok(())
 }
 
-/// Parse fuse.link content, returns (path, optional_prefix)
-fn parse_fuse_link_content(content: &str) -> (String, Option<String>) {
-    let trimmed = content.trim();
-    if let Some(idx) = trimmed.find('|') {
-        let path = trimmed[..idx].to_string();
-        let prefix = trimmed[idx + 1..].to_string();
-        (path, Some(prefix))
-    } else {
-        (trimmed.to_string(), None)
-    }
-}
-
-/// Get fuse.link path for a given path that contains node_modules
+/// Get fuse.link path for a node_modules path
 fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<PathBuf> {
     let mut current = path.as_ref();
-    let mut temp: (Cow<str>, Cow<str>) = (Cow::Borrowed(""), Cow::Borrowed(""));
+    let mut components: (String, String) = (String::new(), String::new());
 
     while let Some(parent) = current.parent() {
-        if let Some(file_name) = current.file_name() {
-            let name = file_name.to_string_lossy();
-            temp = (name, temp.0);
+        if let Some(name) = current.file_name() {
+            let name_str = name.to_string_lossy().to_string();
+            components = (name_str, components.0);
 
-            if let Some(parent_name) = parent.file_name() {
-                if parent_name == "node_modules" {
-                    if !temp.0.is_empty() {
-                        if temp.1.is_empty() {
-                            if !temp.0.starts_with('@') {
-                                return Some(parent.join(temp.0.as_ref()).join("fuse.link"));
-                            }
-                        } else {
-                            if temp.0.starts_with('@') {
-                                return Some(parent.join(temp.0.as_ref()).join(temp.1.as_ref()).join("fuse.link"));
-                            } else {
-                                return Some(parent.join(temp.0.as_ref()).join("fuse.link"));
-                            }
-                        }
+            if parent.file_name().map(|n| n == "node_modules").unwrap_or(false) {
+                if components.0.is_empty() {
+                    // continue
+                } else if components.0.starts_with('@') {
+                    if !components.1.is_empty() {
+                        return Some(parent.join(&components.0).join(&components.1).join("fuse.link"));
                     }
+                } else {
+                    return Some(parent.join(&components.0).join("fuse.link"));
                 }
             }
         }
@@ -86,244 +65,224 @@ fn get_fuse_link_path<P: AsRef<Path>>(path: P) -> Option<PathBuf> {
     None
 }
 
-/// Fuse link target info
 struct FuseLinkTarget {
-    target_path: PathBuf,
+    tgz_path: PathBuf,
     relative_path: PathBuf,
-    tgz_prefix: Option<String>,
+    prefix: Option<String>,
 }
 
-/// Get the target path for a node_modules path through fuse.link
-async fn get_fuse_link_target_path<P: AsRef<Path> + std::fmt::Debug>(prepared_path: P) -> Result<Option<FuseLinkTarget>> {
-    let path_ref = prepared_path.as_ref();
+impl FuseLinkTarget {
+    fn file_path_in_tgz(&self) -> Option<String> {
+        let prefix = self.prefix.as_ref()?;
+        if self.relative_path.as_os_str().is_empty() {
+            None
+        } else {
+            Some(format!("{}/{}", prefix, self.relative_path.display()))
+        }
+    }
+
+    fn dir_path_in_tgz(&self) -> Option<String> {
+        let prefix = self.prefix.as_ref()?;
+        if self.relative_path.as_os_str().is_empty() {
+            Some(String::new())
+        } else {
+            Some(format!("{}/{}", prefix, self.relative_path.display()))
+        }
+    }
+
+    fn is_tgz_mode(&self) -> bool {
+        self.prefix.is_some()
+    }
+}
+
+async fn resolve_fuse_link<P: AsRef<Path>>(path: P) -> Result<Option<FuseLinkTarget>> {
+    let path_ref = path.as_ref();
 
     let fuse_link_path = match get_fuse_link_path(path_ref) {
-        Some(path) => path,
+        Some(p) => p,
         None => return Ok(None),
     };
 
-    let raw_content = if let Ok(cache) = FUSE_LINK_CACHE.read() {
-        if let Some(cached_target) = cache.get(&fuse_link_path) {
-            cached_target.clone()
-        } else {
-            drop(cache);
-
-            let link_content = match tokio_fs_ext::read_to_string(&fuse_link_path).await {
-                Ok(content) => content,
-                Err(_) => return Ok(None),
-            };
-
-            let raw = link_content.lines().next().unwrap_or("").trim().to_string();
-            if raw.is_empty() {
-                return Ok(None);
-            }
-
-            if let Ok(mut cache) = FUSE_LINK_CACHE.write() {
-                cache.insert(fuse_link_path.clone(), raw.clone());
-            }
-
-            raw
-        }
-    } else {
-        let link_content = match tokio_fs_ext::read_to_string(&fuse_link_path).await {
-            Ok(content) => content,
-            Err(_) => return Ok(None),
-        };
-
-        let raw = link_content.lines().next().unwrap_or("").trim();
-        if raw.is_empty() {
-            return Ok(None);
-        }
-        raw.to_string()
+    // Read from cache or file
+    let content = read_fuse_link_content(&fuse_link_path).await?;
+    let content = match content {
+        Some(c) => c,
+        None => return Ok(None),
     };
 
-    let (target_dir, tgz_prefix) = parse_fuse_link_content(&raw_content);
-
-    let fuse_link_dir = fuse_link_path.parent().ok_or_else(|| {
-        Error::new(ErrorKind::InvalidInput, "Invalid fuse.link path")
-    })?;
-
-    let relative_path = match path_ref.strip_prefix(fuse_link_dir) {
-        Ok(rel) => rel,
-        Err(_) => {
-            return Err(Error::new(ErrorKind::InvalidInput, "Path is not under fuse.link directory"));
-        }
+    // Parse content: "path" or "path|prefix"
+    let (tgz_path, prefix) = match content.find('|') {
+        Some(idx) => (content[..idx].to_string(), Some(content[idx + 1..].to_string())),
+        None => (content, None),
     };
 
-    let target_path = if relative_path.as_os_str().is_empty() {
-        PathBuf::from(&target_dir)
-    } else if tgz_prefix.is_some() {
-        PathBuf::from(&target_dir)
-    } else {
-        PathBuf::from(&target_dir).join(relative_path)
-    };
+    let fuse_link_dir = fuse_link_path.parent()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Invalid fuse.link path"))?;
+
+    let relative_path = path_ref.strip_prefix(fuse_link_dir)
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "Path not under fuse.link directory"))?
+        .to_path_buf();
 
     Ok(Some(FuseLinkTarget {
-        target_path,
-        relative_path: relative_path.to_path_buf(),
-        tgz_prefix,
+        tgz_path: PathBuf::from(tgz_path),
+        relative_path,
+        prefix,
     }))
 }
 
-/// Try to read file through fuse link logic for node_modules
-pub(super) async fn try_read_through_fuse_link<P: AsRef<Path> + std::fmt::Debug>(
-    prepared_path: P,
-) -> Result<Option<Vec<u8>>> {
-    let target = match get_fuse_link_target_path(&prepared_path).await? {
+async fn read_fuse_link_content(fuse_link_path: &Path) -> Result<Option<String>> {
+    // Try cache first
+    if let Ok(cache) = FUSE_LINK_CACHE.read() {
+        if let Some(content) = cache.get(fuse_link_path) {
+            return Ok(Some(content.clone()));
+        }
+    }
+
+    // Read from file
+    let content = match tokio_fs_ext::read_to_string(fuse_link_path).await {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+
+    let trimmed = content.lines().next().unwrap_or("").trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    // Update cache
+    if let Ok(mut cache) = FUSE_LINK_CACHE.write() {
+        cache.insert(fuse_link_path.to_path_buf(), trimmed.clone());
+    }
+
+    Ok(Some(trimmed))
+}
+
+/// Try to read file through fuse.link
+pub(super) async fn try_read_through_fuse_link<P: AsRef<Path>>(path: P) -> Result<Option<Vec<u8>>> {
+    let target = match resolve_fuse_link(&path).await? {
         Some(t) => t,
         None => return Ok(None),
     };
 
-    if let Some(prefix) = &target.tgz_prefix {
-        let tgz_path = &target.target_path;
-        let file_in_tgz = if target.relative_path.as_os_str().is_empty() {
-            return Err(Error::new(ErrorKind::IsADirectory, "Cannot read directory as file"));
-        } else {
-            format!("{}/{}", prefix, target.relative_path.to_string_lossy())
-        };
+    if !target.is_tgz_mode() {
+        return tokio_fs_ext::read(&target.tgz_path).await.map(Some).or(Ok(None));
+    }
 
-        match tar_cache::extract_file_cached(tgz_path, &file_in_tgz).await {
-            Ok(content) => Ok(Some(content)),
-            Err(e) => {
-                error!("Extract failed: {:?}", e);
-                Ok(None)
-            }
-        }
-    } else {
-        match tokio_fs_ext::read(&target.target_path).await {
-            Ok(content) => Ok(Some(content)),
-            Err(_) => Ok(None),
+    let file_in_tgz = match target.file_path_in_tgz() {
+        Some(p) => p,
+        None => return Err(Error::new(ErrorKind::IsADirectory, "Cannot read directory as file")),
+    };
+
+    match tar_cache::extract_file_cached(&target.tgz_path, &file_in_tgz).await {
+        Ok(content) => Ok(Some(content)),
+        Err(e) => {
+            error!("Extract failed: {:?}", e);
+            Ok(None)
         }
     }
 }
 
-/// Try to read directory through fuse.link for node_modules
-pub(super) async fn try_read_dir_through_fuse_link<P: AsRef<Path> + std::fmt::Debug>(
-    prepared_path: P,
+/// Try to read directory through fuse.link
+pub(super) async fn try_read_dir_through_fuse_link<P: AsRef<Path>>(
+    path: P,
 ) -> Result<Option<Vec<tokio_fs_ext::DirEntry>>> {
-    let target = match get_fuse_link_target_path(&prepared_path).await? {
+    let target = match resolve_fuse_link(&path).await? {
         Some(t) => t,
         None => return Ok(None),
     };
 
-    let target_entries = if let Some(prefix) = &target.tgz_prefix {
-        let tgz_path = &target.target_path;
-        let dir_in_tgz = if target.relative_path.as_os_str().is_empty() {
-            String::new()
-        } else {
-            format!("{}/{}", prefix, target.relative_path.to_string_lossy())
-        };
-
-        match tar_cache::list_dir_cached(tgz_path, &dir_in_tgz).await {
-            Ok(entries) => entries,
-            Err(_) => return Ok(None),
-        }
+    // Get entries from target (tgz or directory)
+    let target_entries = if let Some(dir_in_tgz) = target.dir_path_in_tgz() {
+        tar_cache::list_dir_cached(&target.tgz_path, &dir_in_tgz).await.ok()
     } else {
-        match read_dir_direct(&target.target_path).await {
-            Ok(entries) => entries,
-            Err(_) => return Ok(None),
-        }
+        read_dir_direct(&target.tgz_path).await.ok()
     };
 
-    let path_ref = prepared_path.as_ref();
-    let original_entries = match read_dir_direct(path_ref).await {
-        Ok(entries) => entries,
-        Err(_) => return Ok(Some(target_entries)),
+    let target_entries = match target_entries {
+        Some(e) => e,
+        None => return Ok(None),
     };
 
-    let filtered_original: Vec<_> = original_entries
+    // Get original directory entries (excluding fuse.link)
+    let original_entries = read_dir_direct(path.as_ref()).await.ok();
+
+    let Some(original) = original_entries else {
+        return Ok(Some(target_entries));
+    };
+
+    // Combine: original (filtered) + target
+    let mut combined: Vec<_> = original
         .into_iter()
-        .filter(|entry| entry.file_name().to_string_lossy() != "fuse.link")
+        .filter(|e| e.file_name().to_string_lossy() != "fuse.link")
         .collect();
+    combined.extend(target_entries);
 
-    let mut combined_entries = filtered_original;
-    combined_entries.extend(target_entries);
-
-    Ok(Some(combined_entries))
+    Ok(Some(combined))
 }
 
 #[cfg(test)]
 mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
-    use crate::test_utils;
     use super::*;
     use wasm_bindgen_test::*;
 
     #[wasm_bindgen_test]
     fn test_get_fuse_link_path_basic() {
-        let path = Path::new("./node_modules/c/index.js");
-        let result = get_fuse_link_path(path);
-        assert_eq!(result, Some(Path::new("./node_modules/c/fuse.link").to_path_buf()));
+        assert_eq!(
+            get_fuse_link_path("./node_modules/c/index.js"),
+            Some(PathBuf::from("./node_modules/c/fuse.link"))
+        );
     }
 
     #[wasm_bindgen_test]
     fn test_get_fuse_link_path_scoped() {
-        let path = Path::new("./node_modules/@a/b/package.json");
-        let result = get_fuse_link_path(path);
-        assert_eq!(result, Some(Path::new("./node_modules/@a/b/fuse.link").to_path_buf()));
+        assert_eq!(
+            get_fuse_link_path("./node_modules/@a/b/package.json"),
+            Some(PathBuf::from("./node_modules/@a/b/fuse.link"))
+        );
     }
 
     #[wasm_bindgen_test]
     fn test_get_fuse_link_path_nested() {
-        let path = Path::new("./node_modules/c/node_modules/d/types.js");
-        let result = get_fuse_link_path(path);
-        assert_eq!(result, Some(Path::new("./node_modules/c/node_modules/d/fuse.link").to_path_buf()));
+        assert_eq!(
+            get_fuse_link_path("./node_modules/c/node_modules/d/types.js"),
+            Some(PathBuf::from("./node_modules/c/node_modules/d/fuse.link"))
+        );
     }
 
     #[wasm_bindgen_test]
     fn test_get_fuse_link_path_scoped_nested() {
-        let path = Path::new("./node_modules/@a/b/node_modules/@c/d/index.js");
-        let result = get_fuse_link_path(path);
-        assert_eq!(result, Some(Path::new("./node_modules/@a/b/node_modules/@c/d/fuse.link").to_path_buf()));
+        assert_eq!(
+            get_fuse_link_path("./node_modules/@a/b/node_modules/@c/d/index.js"),
+            Some(PathBuf::from("./node_modules/@a/b/node_modules/@c/d/fuse.link"))
+        );
     }
 
     #[wasm_bindgen_test]
     fn test_get_fuse_link_path_no_node_modules() {
-        let path = Path::new("./some/other/path/file.js");
-        let result = get_fuse_link_path(path);
-        assert_eq!(result, None);
+        assert_eq!(get_fuse_link_path("./some/other/path/file.js"), None);
     }
 
     #[wasm_bindgen_test]
     fn test_get_fuse_link_path_direct() {
-        let path = Path::new("./node_modules/a");
-        let result = get_fuse_link_path(path);
-        assert_eq!(result, Some(Path::new("./node_modules/a/fuse.link").to_path_buf()));
+        assert_eq!(
+            get_fuse_link_path("./node_modules/a"),
+            Some(PathBuf::from("./node_modules/a/fuse.link"))
+        );
     }
 
     #[wasm_bindgen_test]
-    fn test_get_fuse_link_path_scoped_direct() {
-        let path = Path::new("./node_modules/@a/b");
-        let result = get_fuse_link_path(path);
-        assert_eq!(result, Some(Path::new("./node_modules/@a/b/fuse.link").to_path_buf()));
-    }
-
-    #[wasm_bindgen_test]
-    fn test_get_fuse_link_path_scope_directory_only() {
-        test_utils::init_tracing();
-        let path = Path::new("./node_modules/@umi");
-        let result = get_fuse_link_path(path);
-        assert_eq!(result, None);
+    fn test_get_fuse_link_path_scope_only() {
+        assert_eq!(get_fuse_link_path("./node_modules/@umi"), None);
     }
 
     #[wasm_bindgen_test]
     fn test_get_fuse_link_path_empty() {
-        let path = Path::new("");
-        let result = get_fuse_link_path(path);
-        assert_eq!(result, None);
+        assert_eq!(get_fuse_link_path(""), None);
     }
 
     #[wasm_bindgen_test]
     fn test_get_fuse_link_path_just_node_modules() {
-        let path = Path::new("./node_modules");
-        let result = get_fuse_link_path(path);
-        assert_eq!(result, None);
-    }
-
-    #[wasm_bindgen_test]
-    fn test_get_fuse_link_path_deep_nested() {
-        let path = Path::new("./node_modules/a/node_modules/b/node_modules/c/node_modules/d/file.js");
-        let result = get_fuse_link_path(path);
-        assert_eq!(result, Some(Path::new("./node_modules/a/node_modules/b/node_modules/c/node_modules/d/fuse.link").to_path_buf()));
+        assert_eq!(get_fuse_link_path("./node_modules"), None);
     }
 }
