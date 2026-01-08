@@ -1,10 +1,13 @@
 //! Lazy package manager - downloads tgz only, extracts on-demand
 
 use anyhow::{Context, Result};
+use futures::stream::{self, StreamExt};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::fuse;
 use crate::pack;
+use crate::package_lock::PackageLock;
 
 /// Public package paths for lazy extraction
 pub struct PublicPackagePaths {
@@ -104,6 +107,106 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
         .context(format!("Failed to read response from {}", url))?;
 
     Ok(bytes.to_vec())
+}
+
+const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 20;
+
+/// Internal package group structure for deduplication
+struct PackageGroup {
+    name: String,
+    version: String,
+    tgz_url: String,
+    integrity: Option<String>,
+    shasum: Option<String>,
+    target_paths: Vec<String>,
+}
+
+/// Install dependencies from package-lock.json
+/// Downloads tgz files only, creates fuse links for lazy extraction
+pub async fn install(lock: &PackageLock, max_concurrent_downloads: Option<usize>) -> Result<()> {
+    // Step 1: Group packages by tgz URL to deduplicate downloads
+    let mut groups: HashMap<String, PackageGroup> = HashMap::new();
+
+    for (path, pkg) in lock.packages.iter().filter(|(path, _)| !path.is_empty()) {
+        let name = pkg.get_name(path);
+        let version = pkg.get_version();
+        let tgz_url = match &pkg.resolved {
+            Some(u) => u.clone(),
+            None => {
+                tracing::warn!("{}@{}: no resolved field, skipping", name, version);
+                continue;
+            }
+        };
+
+        groups
+            .entry(tgz_url.clone())
+            .or_insert_with(|| PackageGroup {
+                name,
+                version,
+                tgz_url,
+                integrity: pkg.integrity.clone(),
+                shasum: pkg.shasum.clone(),
+                target_paths: Vec::new(),
+            })
+            .target_paths
+            .push(path.clone());
+    }
+
+    // Step 2: Partition by cache status (check if tgz already downloaded)
+    let mut cached: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    let mut to_download: Vec<PackageGroup> = Vec::new();
+
+    for group in groups.into_values() {
+        let paths = PublicPackagePaths::new(&group.name, &group.tgz_url);
+        if is_tgz_cached(&paths).await {
+            cached.push((paths.tgz_store_path, group.target_paths));
+        } else {
+            to_download.push(group);
+        }
+    }
+
+    // Step 3: Create lazy fuse links for cached packages
+    for (tgz_path, target_paths) in cached {
+        create_fuse_links_lazy(&tgz_path, &target_paths, Some("package")).await?;
+    }
+
+    // Step 4: Download non-cached packages
+    if !to_download.is_empty() {
+        let max_concurrent = max_concurrent_downloads.unwrap_or(DEFAULT_MAX_CONCURRENT_DOWNLOADS);
+
+        let download_results: Vec<_> = stream::iter(to_download.iter().map(|group| {
+            let name = group.name.clone();
+            let version = group.version.clone();
+            let tgz_url = group.tgz_url.clone();
+            let integrity = group.integrity.clone();
+            let shasum = group.shasum.clone();
+
+            async move {
+                let _bytes = download_only(
+                    &name,
+                    &version,
+                    &tgz_url,
+                    integrity.as_deref(),
+                    shasum.as_deref(),
+                )
+                .await?;
+                Ok::<(String, String), anyhow::Error>((name, tgz_url))
+            }
+        }))
+        .buffer_unordered(max_concurrent)
+        .collect()
+        .await;
+
+        // Create lazy fuse links for downloaded packages
+        for (result, group) in download_results.into_iter().zip(to_download.into_iter()) {
+            let (name, tgz_url) = result?;
+            let paths = PublicPackagePaths::new(&name, &tgz_url);
+            create_fuse_links_lazy(&paths.tgz_store_path, &group.target_paths, Some("package"))
+                .await?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -238,5 +341,244 @@ mod tests {
             assert!(content.contains("/stores/test-pkg/-/test-pkg-1.0.0.tgz"));
             assert!(content.contains("|package"));
         }
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_install_empty_packages() {
+        test_utils::init_tracing();
+
+        let lock = PackageLock {
+            name: "test-project".to_string(),
+            version: "1.0.0".to_string(),
+            lockfile_version: 3,
+            requires: true,
+            packages: HashMap::new(),
+            dependencies: None,
+        };
+
+        let result = install(&lock, None).await;
+        assert!(result.is_ok());
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_install_skip_no_resolved() {
+        test_utils::init_tracing();
+
+        use crate::package_lock::LockPackage;
+
+        let mut packages = HashMap::new();
+        // Root package (should be skipped)
+        packages.insert("".to_string(), LockPackage {
+            name: Some("test-project".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: None,
+            integrity: None,
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+        // Package without resolved (should be skipped with warning)
+        packages.insert("node_modules/no-resolved-pkg".to_string(), LockPackage {
+            name: Some("no-resolved-pkg".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: None,
+            integrity: None,
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        let lock = PackageLock {
+            name: "test-project".to_string(),
+            version: "1.0.0".to_string(),
+            lockfile_version: 3,
+            requires: true,
+            packages,
+            dependencies: None,
+        };
+
+        // Should succeed, just skip the package without resolved
+        let result = install(&lock, None).await;
+        assert!(result.is_ok());
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_install_single_package() {
+        test_utils::init_tracing();
+
+        use crate::package_lock::LockPackage;
+
+        // Clean up first
+        let _ = tokio_fs_ext::remove_dir_all("node_modules/is-number").await;
+
+        let mut packages = HashMap::new();
+        packages.insert("".to_string(), LockPackage {
+            name: Some("test-project".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: None,
+            integrity: None,
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+        packages.insert("node_modules/is-number".to_string(), LockPackage {
+            name: Some("is-number".to_string()),
+            version: Some("7.0.0".to_string()),
+            resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
+            integrity: Some("sha512-41Cifbd2J2OprW0MKfqm9+D/E0lzhYPUKrfBAb5T0CvoEOSr10phKaoTJqj61F6Dnj/OHwdRc6lnLbhAQhHVNg==".to_string()),
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        let lock = PackageLock {
+            name: "test-project".to_string(),
+            version: "1.0.0".to_string(),
+            lockfile_version: 3,
+            requires: true,
+            packages,
+            dependencies: None,
+        };
+
+        let result = install(&lock, Some(5)).await;
+        assert!(result.is_ok());
+
+        // Verify fuse link was created
+        let fuse_link = tokio_fs_ext::read_to_string("node_modules/is-number/fuse.link").await;
+        assert!(fuse_link.is_ok());
+        assert!(fuse_link.unwrap().contains("is-number-7.0.0.tgz"));
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_install_deduplication() {
+        test_utils::init_tracing();
+
+        use crate::package_lock::LockPackage;
+
+        // Clean up first
+        let _ = tokio_fs_ext::remove_dir_all("node_modules/is-number").await;
+        let _ = tokio_fs_ext::remove_dir_all("node_modules/other/node_modules/is-number").await;
+
+        let mut packages = HashMap::new();
+        packages.insert("".to_string(), LockPackage {
+            name: Some("test-project".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: None,
+            integrity: None,
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+        // Same package at two locations (should deduplicate download)
+        packages.insert("node_modules/is-number".to_string(), LockPackage {
+            name: Some("is-number".to_string()),
+            version: Some("7.0.0".to_string()),
+            resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
+            integrity: Some("sha512-41Cifbd2J2OprW0MKfqm9+D/E0lzhYPUKrfBAb5T0CvoEOSr10phKaoTJqj61F6Dnj/OHwdRc6lnLbhAQhHVNg==".to_string()),
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+        packages.insert("node_modules/other/node_modules/is-number".to_string(), LockPackage {
+            name: Some("is-number".to_string()),
+            version: Some("7.0.0".to_string()),
+            resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
+            integrity: Some("sha512-41Cifbd2J2OprW0MKfqm9+D/E0lzhYPUKrfBAb5T0CvoEOSr10phKaoTJqj61F6Dnj/OHwdRc6lnLbhAQhHVNg==".to_string()),
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        let lock = PackageLock {
+            name: "test-project".to_string(),
+            version: "1.0.0".to_string(),
+            lockfile_version: 3,
+            requires: true,
+            packages,
+            dependencies: None,
+        };
+
+        let result = install(&lock, None).await;
+        assert!(result.is_ok());
+
+        // Verify both fuse links were created
+        let fuse_link1 = tokio_fs_ext::read_to_string("node_modules/is-number/fuse.link").await;
+        assert!(fuse_link1.is_ok());
+
+        let fuse_link2 = tokio_fs_ext::read_to_string("node_modules/other/node_modules/is-number/fuse.link").await;
+        assert!(fuse_link2.is_ok());
+
+        // Both should point to the same tgz
+        assert_eq!(fuse_link1.unwrap(), fuse_link2.unwrap());
     }
 }
