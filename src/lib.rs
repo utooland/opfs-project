@@ -3,18 +3,24 @@
 use std::{
     io::Result,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 mod fuse;
-mod package_lock;
+pub mod package_lock;
 pub mod package_manager;
 pub mod pack;
+pub mod tar_cache;
 mod util;
 
 pub use tokio_fs_ext::DirEntry;
 
+// Re-export fuse link functions for lazy extraction
+pub use fuse::fuse_link_with_prefix;
+pub use package_manager::{PublicPackagePaths, is_tgz_cached, download_only, create_fuse_links_lazy};
+
 /// Read file content with fuse.link support
-pub async fn read<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
+pub async fn read<P: AsRef<Path>>(path: P) -> Result<Arc<Vec<u8>>> {
     let path_ref = path.as_ref();
     let prepared_path = crate::util::prepare_path(path_ref);
 
@@ -25,7 +31,7 @@ pub async fn read<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
 
     // Fallback to direct read
     let content = tokio_fs_ext::read(&prepared_path).await?;
-    Ok(content)
+    Ok(Arc::new(content))
 }
 
 /// Read directory contents with file type information and fuse.link support
