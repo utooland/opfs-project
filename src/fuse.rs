@@ -1,7 +1,7 @@
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
-use std::sync::{RwLock, LazyLock};
+use std::sync::{Arc, RwLock, LazyLock};
 
 use crate::util::read_dir_direct;
 use crate::tar_cache;
@@ -158,14 +158,14 @@ async fn read_fuse_link_content(fuse_link_path: &Path) -> Result<Option<String>>
 }
 
 /// Try to read file through fuse.link
-pub(super) async fn try_read_through_fuse_link<P: AsRef<Path>>(path: P) -> Result<Option<Vec<u8>>> {
+pub(super) async fn try_read_through_fuse_link<P: AsRef<Path>>(path: P) -> Result<Option<Arc<Vec<u8>>>> {
     let target = match resolve_fuse_link(&path).await? {
         Some(t) => t,
         None => return Ok(None),
     };
 
     if !target.is_tgz_mode() {
-        return tokio_fs_ext::read(&target.tgz_path).await.map(Some).or(Ok(None));
+        return tokio_fs_ext::read(&target.tgz_path).await.map(|v| Some(Arc::new(v))).or(Ok(None));
     }
 
     let file_in_tgz = match target.file_path_in_tgz() {

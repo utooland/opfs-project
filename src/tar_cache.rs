@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Error, ErrorKind, Read, Result};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use flate2::read::GzDecoder;
 use tar::Archive;
@@ -18,7 +18,7 @@ fn strip_first_component(path: &str) -> &str {
 }
 
 struct TgzCacheEntry {
-    files: HashMap<String, Vec<u8>>,
+    files: HashMap<String, Arc<Vec<u8>>>,
     total_size: usize,
     last_accessed: Instant,
 }
@@ -38,7 +38,7 @@ impl TarCache {
         }
     }
 
-    fn get_file(&mut self, tgz_path: &Path, normalized_path: &str) -> Option<Vec<u8>> {
+    fn get_file(&mut self, tgz_path: &Path, normalized_path: &str) -> Option<Arc<Vec<u8>>> {
         let entry = self.cache.get_mut(tgz_path)?;
         entry.last_accessed = Instant::now();
         entry.files.get(normalized_path).cloned()
@@ -48,7 +48,7 @@ impl TarCache {
         self.cache.contains_key(tgz_path)
     }
 
-    fn insert_tgz(&mut self, tgz_path: PathBuf, files: HashMap<String, Vec<u8>>, total_size: usize) {
+    fn insert_tgz(&mut self, tgz_path: PathBuf, files: HashMap<String, Arc<Vec<u8>>>, total_size: usize) {
         // Skip if already cached (double-check)
         if self.cache.contains_key(&tgz_path) {
             return;
@@ -123,7 +123,7 @@ static TAR_CACHE: LazyLock<RwLock<TarCache>> =
     LazyLock::new(|| RwLock::new(TarCache::new(DEFAULT_MAX_SIZE)));
 
 /// Parse tgz bytes into files map (sync, no lock held)
-fn parse_tgz(tgz_bytes: &[u8]) -> Result<(HashMap<String, Vec<u8>>, usize)> {
+fn parse_tgz(tgz_bytes: &[u8]) -> Result<(HashMap<String, Arc<Vec<u8>>>, usize)> {
     let gz = GzDecoder::new(tgz_bytes);
     let mut archive = Archive::new(gz);
 
@@ -142,7 +142,7 @@ fn parse_tgz(tgz_bytes: &[u8]) -> Result<(HashMap<String, Vec<u8>>, usize)> {
         let mut content = Vec::new();
         entry.read_to_end(&mut content)?;
         total_size += content.len();
-        files.insert(normalized, content);
+        files.insert(normalized, Arc::new(content));
     }
 
     Ok((files, total_size))
@@ -168,7 +168,7 @@ async fn ensure_tgz_cached(tgz_path: &Path) -> Result<()> {
 }
 
 /// Extract file with caching
-pub async fn extract_file_cached(tgz_path: &Path, file_path: &str) -> Result<Vec<u8>> {
+pub async fn extract_file_cached(tgz_path: &Path, file_path: &str) -> Result<Arc<Vec<u8>>> {
     let normalized_path = strip_first_component(file_path).to_string();
 
     // Try cache first
