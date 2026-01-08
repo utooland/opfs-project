@@ -11,22 +11,18 @@ use tar::Archive;
 use tokio_fs_ext::{DirEntry, FileType};
 use web_time::Instant;
 
-/// Strip the first path component (e.g., "package/" prefix in npm tarballs)
+const DEFAULT_MAX_SIZE: usize = 100 * 1024 * 1024; // 100MB
+
 fn strip_first_component(path: &str) -> &str {
     path.find('/').map(|idx| &path[idx + 1..]).unwrap_or(path)
 }
 
-/// Default cache size: 100MB
-const DEFAULT_MAX_SIZE: usize = 100 * 1024 * 1024;
-
-/// Cached tgz content - all files from a single tgz
 struct TgzCacheEntry {
     files: HashMap<String, Vec<u8>>,
     total_size: usize,
     last_accessed: Instant,
 }
 
-/// LRU cache for entire tgz packages
 struct TarCache {
     cache: HashMap<PathBuf, TgzCacheEntry>,
     current_size: usize,
@@ -43,45 +39,41 @@ impl TarCache {
     }
 
     fn get_file(&mut self, tgz_path: &Path, normalized_path: &str) -> Option<Vec<u8>> {
-        if let Some(entry) = self.cache.get_mut(tgz_path) {
-            entry.last_accessed = Instant::now();
-            return entry.files.get(normalized_path).cloned();
-        }
-        None
+        let entry = self.cache.get_mut(tgz_path)?;
+        entry.last_accessed = Instant::now();
+        entry.files.get(normalized_path).cloned()
     }
 
     fn has_tgz(&self, tgz_path: &Path) -> bool {
         self.cache.contains_key(tgz_path)
     }
 
-    fn put_tgz(&mut self, tgz_path: PathBuf, files: HashMap<String, Vec<u8>>, total_size: usize) {
+    fn insert_tgz(&mut self, tgz_path: PathBuf, files: HashMap<String, Vec<u8>>, total_size: usize) {
+        // Skip if already cached (double-check)
+        if self.cache.contains_key(&tgz_path) {
+            return;
+        }
+
+        // Skip if too large
         if total_size > self.max_size {
             return;
         }
 
+        // Evict until we have space
         while self.current_size + total_size > self.max_size && !self.cache.is_empty() {
             self.evict_oldest();
         }
 
-        if let Some(old) = self.cache.remove(&tgz_path) {
-            self.current_size -= old.total_size;
-        }
-
         self.current_size += total_size;
-        self.cache.insert(
-            tgz_path,
-            TgzCacheEntry {
-                files,
-                total_size,
-                last_accessed: Instant::now(),
-            },
-        );
+        self.cache.insert(tgz_path, TgzCacheEntry {
+            files,
+            total_size,
+            last_accessed: Instant::now(),
+        });
     }
 
     fn evict_oldest(&mut self) {
-        let oldest = self
-            .cache
-            .iter()
+        let oldest = self.cache.iter()
             .min_by_key(|(_, e)| e.last_accessed)
             .map(|(k, _)| k.clone());
 
@@ -130,12 +122,12 @@ impl TarCache {
 static TAR_CACHE: LazyLock<RwLock<TarCache>> =
     LazyLock::new(|| RwLock::new(TarCache::new(DEFAULT_MAX_SIZE)));
 
-async fn load_tgz_to_cache(tgz_path: &Path) -> Result<()> {
-    let tgz_bytes = tokio_fs_ext::read(tgz_path).await?;
-    let gz = GzDecoder::new(tgz_bytes.as_slice());
+/// Parse tgz bytes into files map (sync, no lock held)
+fn parse_tgz(tgz_bytes: &[u8]) -> Result<(HashMap<String, Vec<u8>>, usize)> {
+    let gz = GzDecoder::new(tgz_bytes);
     let mut archive = Archive::new(gz);
 
-    let mut files: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut files = HashMap::new();
     let mut total_size = 0usize;
 
     for entry_result in archive.entries()? {
@@ -153,46 +145,56 @@ async fn load_tgz_to_cache(tgz_path: &Path) -> Result<()> {
         files.insert(normalized, content);
     }
 
+    Ok((files, total_size))
+}
+
+/// Ensure tgz is loaded into cache (with double-checked locking)
+async fn ensure_tgz_cached(tgz_path: &Path) -> Result<()> {
+    // First check with read lock
+    if TAR_CACHE.read().map(|c| c.has_tgz(tgz_path)).unwrap_or(false) {
+        return Ok(());
+    }
+
+    // Read file without holding lock
+    let tgz_bytes = tokio_fs_ext::read(tgz_path).await?;
+    let (files, total_size) = parse_tgz(&tgz_bytes)?;
+
+    // Insert with write lock (double-check inside insert_tgz)
     if let Ok(mut cache) = TAR_CACHE.write() {
-        cache.put_tgz(tgz_path.to_path_buf(), files, total_size);
+        cache.insert_tgz(tgz_path.to_path_buf(), files, total_size);
     }
 
     Ok(())
 }
 
-/// Extract file with caching (caches entire tgz on first access)
+/// Extract file with caching
 pub async fn extract_file_cached(tgz_path: &Path, file_path: &str) -> Result<Vec<u8>> {
     let normalized_path = strip_first_component(file_path).to_string();
 
-    // Check cache
-    if let Ok(mut cache) = TAR_CACHE.write() {
-        if let Some(content) = cache.get_file(tgz_path, &normalized_path) {
-            return Ok(content);
-        }
+    // Try cache first
+    if let Ok(mut cache) = TAR_CACHE.write()
+        && let Some(content) = cache.get_file(tgz_path, &normalized_path)
+    {
+        return Ok(content);
     }
 
-    // Load tgz if not cached
-    let needs_load = TAR_CACHE
-        .read()
-        .map(|c| !c.has_tgz(tgz_path))
-        .unwrap_or(true);
+    // Load if needed
+    ensure_tgz_cached(tgz_path).await?;
 
-    if needs_load {
-        load_tgz_to_cache(tgz_path).await?;
+    // Get from cache
+    let Ok(mut cache) = TAR_CACHE.write() else {
+        return Err(Error::new(ErrorKind::Other, "Failed to acquire cache lock"));
+    };
+
+    if let Some(content) = cache.get_file(tgz_path, &normalized_path) {
+        return Ok(content);
     }
 
-    // Try cache again
-    if let Ok(mut cache) = TAR_CACHE.write() {
-        if let Some(content) = cache.get_file(tgz_path, &normalized_path) {
-            return Ok(content);
-        }
-
-        // Check if it's a directory
-        if let Some(entry) = cache.cache.get(tgz_path) {
-            let dir_prefix = format!("{}/", normalized_path);
-            if entry.files.keys().any(|k| k.starts_with(&dir_prefix)) {
-                return Err(Error::new(ErrorKind::IsADirectory, format!("{} is a directory", file_path)));
-            }
+    // Check if it's a directory
+    if let Some(entry) = cache.cache.get(tgz_path) {
+        let dir_prefix = format!("{}/", normalized_path);
+        if entry.files.keys().any(|k| k.starts_with(&dir_prefix)) {
+            return Err(Error::new(ErrorKind::IsADirectory, format!("{} is a directory", file_path)));
         }
     }
 
@@ -203,36 +205,31 @@ pub async fn extract_file_cached(tgz_path: &Path, file_path: &str) -> Result<Vec
 pub async fn list_dir_cached(tgz_path: &Path, dir_path: &str) -> Result<Vec<DirEntry>> {
     let normalized_dir = strip_first_component(dir_path).to_string();
 
-    let needs_load = TAR_CACHE
-        .read()
-        .map(|c| !c.has_tgz(tgz_path))
-        .unwrap_or(true);
+    ensure_tgz_cached(tgz_path).await?;
 
-    if needs_load {
-        load_tgz_to_cache(tgz_path).await?;
-    }
+    let Ok(mut cache) = TAR_CACHE.write() else {
+        return Ok(vec![]);
+    };
 
-    if let Ok(mut cache) = TAR_CACHE.write() {
-        if let Some(items) = cache.list_dir(tgz_path, &normalized_dir) {
-            return Ok(items
-                .into_iter()
-                .map(|(name, is_dir)| {
-                    let path = if dir_path.is_empty() {
-                        PathBuf::from(&name)
-                    } else {
-                        PathBuf::from(dir_path).join(&name)
-                    };
-                    DirEntry::new(
-                        path,
-                        OsString::from(&name),
-                        if is_dir { FileType::Directory } else { FileType::File },
-                    )
-                })
-                .collect());
-        }
-    }
+    let Some(items) = cache.list_dir(tgz_path, &normalized_dir) else {
+        return Ok(vec![]);
+    };
 
-    Ok(vec![])
+    Ok(items
+        .into_iter()
+        .map(|(name, is_dir)| {
+            let path = if dir_path.is_empty() {
+                PathBuf::from(&name)
+            } else {
+                PathBuf::from(dir_path).join(&name)
+            };
+            DirEntry::new(
+                path,
+                OsString::from(&name),
+                if is_dir { FileType::Directory } else { FileType::File },
+            )
+        })
+        .collect())
 }
 
 /// Clear cache
@@ -243,7 +240,7 @@ pub fn clear_cache() {
     }
 }
 
-/// Set maximum cache size (in bytes)
+/// Set maximum cache size
 pub fn set_max_size(max_size_bytes: usize) {
     if let Ok(mut cache) = TAR_CACHE.write() {
         cache.max_size = max_size_bytes;
