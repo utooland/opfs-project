@@ -449,7 +449,7 @@ mod tests {
             name: Some("is-number".to_string()),
             version: Some("7.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
-            integrity: Some("sha512-41Cifbd2J2OprW0MKfqm9+D/E0lzhYPUKrfBAb5T0CvoEOSr10phKaoTJqj61F6Dnj/OHwdRc6lnLbhAQhHVNg==".to_string()),
+            integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
             shasum: None,
             license: None,
             dependencies: None,
@@ -475,7 +475,7 @@ mod tests {
         };
 
         let result = install(&lock, Some(5)).await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "install failed: {:?}", result.err());
 
         // Verify fuse link was created
         let fuse_link = tokio_fs_ext::read_to_string("node_modules/is-number/fuse.link").await;
@@ -518,7 +518,7 @@ mod tests {
             name: Some("is-number".to_string()),
             version: Some("7.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
-            integrity: Some("sha512-41Cifbd2J2OprW0MKfqm9+D/E0lzhYPUKrfBAb5T0CvoEOSr10phKaoTJqj61F6Dnj/OHwdRc6lnLbhAQhHVNg==".to_string()),
+            integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
             shasum: None,
             license: None,
             dependencies: None,
@@ -537,7 +537,7 @@ mod tests {
             name: Some("is-number".to_string()),
             version: Some("7.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
-            integrity: Some("sha512-41Cifbd2J2OprW0MKfqm9+D/E0lzhYPUKrfBAb5T0CvoEOSr10phKaoTJqj61F6Dnj/OHwdRc6lnLbhAQhHVNg==".to_string()),
+            integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
             shasum: None,
             license: None,
             dependencies: None,
@@ -563,7 +563,7 @@ mod tests {
         };
 
         let result = install(&lock, None).await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "install failed: {:?}", result.err());
 
         // Verify both fuse links were created
         let fuse_link1 = tokio_fs_ext::read_to_string("node_modules/is-number/fuse.link").await;
