@@ -19,11 +19,6 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
-        with:
-          version: latest
-
       - name: Install wasm-bindgen-cli
         uses: jetli/wasm-bindgen-action@v0.2.0
         with:
@@ -42,8 +37,8 @@ jobs:
 
       - name: Run tests
         run: |
-          cargo test --lib
-          wasm-pack test --headless --chrome
+          cargo test
+          cargo test --target wasm32-unknown-unknown
         env:
           RUST_BACKTRACE: 1
 
@@ -59,11 +54,6 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
-        with:
-          version: latest
-
       - name: Cache dependencies
         uses: actions/cache@v4
         with:
@@ -75,10 +65,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Check
-        run: cargo check --target wasm32-unknown-unknown
-
       - name: Build
-        run: wasm-pack build
+        run: |
+          cargo build
+          cargo build --target wasm32-unknown-unknown
         env:
           RUST_BACKTRACE: 1
