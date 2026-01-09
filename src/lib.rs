@@ -15,7 +15,7 @@ mod util;
 
 pub use tokio_fs_ext::DirEntry;
 
-pub use package_manager::install;
+pub use package_manager::{install, InstallOptions, OmitType};
 
 /// Read file content with fuse.link support
 pub async fn read<P: AsRef<Path>>(path: P) -> Result<Arc<Vec<u8>>> {

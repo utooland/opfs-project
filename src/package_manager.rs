@@ -7,7 +7,25 @@ use std::path::PathBuf;
 
 use crate::fuse;
 use crate::pack;
-use crate::package_lock::PackageLock;
+use crate::package_lock::{LockPackage, PackageLock};
+
+/// Types of dependencies that can be omitted during install
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OmitType {
+    /// Skip dev dependencies (packages with dev: true)
+    Dev,
+    /// Skip optional dependencies (packages with optional: true)
+    Optional,
+}
+
+/// Options for install
+#[derive(Debug, Clone, Default)]
+pub struct InstallOptions {
+    /// Maximum concurrent downloads (default: 20)
+    pub max_concurrent_downloads: Option<usize>,
+    /// Types of dependencies to skip
+    pub omit: Vec<OmitType>,
+}
 
 /// Public package paths for lazy extraction
 pub struct PublicPackagePaths {
@@ -121,13 +139,49 @@ struct PackageGroup {
     target_paths: Vec<String>,
 }
 
+/// Check if a package should be omitted based on omit flags
+fn should_omit(pkg: &LockPackage, omit: &[OmitType]) -> bool {
+    omit.iter().any(|o| match o {
+        OmitType::Dev => pkg.dev == Some(true),
+        OmitType::Optional => pkg.optional == Some(true),
+    })
+}
+
 /// Install dependencies from package-lock.json
 /// Downloads tgz files only, creates fuse links for lazy extraction
-pub async fn install(lock: &PackageLock, max_concurrent_downloads: Option<usize>) -> Result<()> {
+///
+/// # Arguments
+/// * `lock` - The parsed package-lock.json
+/// * `options` - Install options (use `None` or `Some(InstallOptions::default())` for defaults)
+///
+/// # Example
+/// ```ignore
+/// // Default options
+/// install(&lock, None).await?;
+///
+/// // With options
+/// install(&lock, Some(InstallOptions {
+///     omit: vec![OmitType::Dev],
+///     ..Default::default()
+/// })).await?;
+/// ```
+pub async fn install(lock: &PackageLock, options: Option<InstallOptions>) -> Result<()> {
+    let opts = options.unwrap_or_default();
+    let omit = &opts.omit;
+
     // Step 1: Group packages by tgz URL to deduplicate downloads
     let mut groups: HashMap<String, PackageGroup> = HashMap::new();
 
     for (path, pkg) in lock.packages.iter().filter(|(path, _)| !path.is_empty()) {
+        // Skip packages based on omit options
+        if should_omit(pkg, omit) {
+            let name = pkg.get_name(path);
+            let version = pkg.get_version();
+            let reason = if pkg.dev == Some(true) { "dev" } else { "optional" };
+            tracing::debug!("{}@{}: skipped ({})", name, version, reason);
+            continue;
+        }
+
         let name = pkg.get_name(path);
         let version = pkg.get_version();
         let tgz_url = match &pkg.resolved {
@@ -172,7 +226,7 @@ pub async fn install(lock: &PackageLock, max_concurrent_downloads: Option<usize>
 
     // Step 4: Download non-cached packages
     if !to_download.is_empty() {
-        let max_concurrent = max_concurrent_downloads.unwrap_or(DEFAULT_MAX_CONCURRENT_DOWNLOADS);
+        let max_concurrent = opts.max_concurrent_downloads.unwrap_or(DEFAULT_MAX_CONCURRENT_DOWNLOADS);
 
         let download_results: Vec<_> = stream::iter(to_download.into_iter().map(|group| {
             async move {
@@ -449,7 +503,7 @@ mod tests {
             name: Some("is-number".to_string()),
             version: Some("7.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
-            integrity: Some("sha512-41Cifbd2J2OprW0MKfqm9+D/E0lzhYPUKrfBAb5T0CvoEOSr10phKaoTJqj61F6Dnj/OHwdRc6lnLbhAQhHVNg==".to_string()),
+            integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
             shasum: None,
             license: None,
             dependencies: None,
@@ -474,8 +528,11 @@ mod tests {
             dependencies: None,
         };
 
-        let result = install(&lock, Some(5)).await;
-        assert!(result.is_ok());
+        let result = install(&lock, Some(InstallOptions {
+            max_concurrent_downloads: Some(5),
+            omit: vec![],
+        })).await;
+        assert!(result.is_ok(), "install failed: {:?}", result.err());
 
         // Verify fuse link was created
         let fuse_link = tokio_fs_ext::read_to_string("node_modules/is-number/fuse.link").await;
@@ -518,7 +575,7 @@ mod tests {
             name: Some("is-number".to_string()),
             version: Some("7.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
-            integrity: Some("sha512-41Cifbd2J2OprW0MKfqm9+D/E0lzhYPUKrfBAb5T0CvoEOSr10phKaoTJqj61F6Dnj/OHwdRc6lnLbhAQhHVNg==".to_string()),
+            integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
             shasum: None,
             license: None,
             dependencies: None,
@@ -537,7 +594,7 @@ mod tests {
             name: Some("is-number".to_string()),
             version: Some("7.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
-            integrity: Some("sha512-41Cifbd2J2OprW0MKfqm9+D/E0lzhYPUKrfBAb5T0CvoEOSr10phKaoTJqj61F6Dnj/OHwdRc6lnLbhAQhHVNg==".to_string()),
+            integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
             shasum: None,
             license: None,
             dependencies: None,
@@ -563,7 +620,7 @@ mod tests {
         };
 
         let result = install(&lock, None).await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "install failed: {:?}", result.err());
 
         // Verify both fuse links were created
         let fuse_link1 = tokio_fs_ext::read_to_string("node_modules/is-number/fuse.link").await;
@@ -574,5 +631,201 @@ mod tests {
 
         // Both should point to the same tgz
         assert_eq!(fuse_link1.unwrap(), fuse_link2.unwrap());
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_install_omit_dev() {
+        test_utils::init_tracing();
+
+        use crate::package_lock::LockPackage;
+
+        // Clean up first
+        let _ = tokio_fs_ext::remove_dir_all("node_modules/prod-pkg").await;
+        let _ = tokio_fs_ext::remove_dir_all("node_modules/dev-pkg").await;
+
+        let mut packages = HashMap::new();
+        packages.insert("".to_string(), LockPackage {
+            name: Some("test-project".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: None,
+            integrity: None,
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        // Production dependency
+        packages.insert("node_modules/prod-pkg".to_string(), LockPackage {
+            name: Some("is-number".to_string()),
+            version: Some("7.0.0".to_string()),
+            resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
+            integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,  // Not a dev dependency
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        // Dev dependency (should be skipped)
+        packages.insert("node_modules/dev-pkg".to_string(), LockPackage {
+            name: Some("is-number".to_string()),
+            version: Some("7.0.0".to_string()),
+            resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
+            integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: Some(true),  // This is a dev dependency
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        let lock = PackageLock {
+            name: "test-project".to_string(),
+            version: "1.0.0".to_string(),
+            lockfile_version: 3,
+            requires: true,
+            packages,
+            dependencies: None,
+        };
+
+        // Install with omit dev
+        let result = install(&lock, Some(InstallOptions {
+            max_concurrent_downloads: None,
+            omit: vec![OmitType::Dev],
+        })).await;
+        assert!(result.is_ok(), "install failed: {:?}", result.err());
+
+        // Verify prod-pkg was installed
+        let prod_link = tokio_fs_ext::read_to_string("node_modules/prod-pkg/fuse.link").await;
+        assert!(prod_link.is_ok(), "prod-pkg should be installed");
+
+        // Verify dev-pkg was NOT installed
+        let dev_link = tokio_fs_ext::read_to_string("node_modules/dev-pkg/fuse.link").await;
+        assert!(dev_link.is_err(), "dev-pkg should be skipped");
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_install_omit_optional() {
+        test_utils::init_tracing();
+
+        use crate::package_lock::LockPackage;
+
+        // Clean up first
+        let _ = tokio_fs_ext::remove_dir_all("node_modules/required-pkg").await;
+        let _ = tokio_fs_ext::remove_dir_all("node_modules/optional-pkg").await;
+
+        let mut packages = HashMap::new();
+        packages.insert("".to_string(), LockPackage {
+            name: Some("test-project".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: None,
+            integrity: None,
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        // Required dependency
+        packages.insert("node_modules/required-pkg".to_string(), LockPackage {
+            name: Some("is-number".to_string()),
+            version: Some("7.0.0".to_string()),
+            resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
+            integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: None,  // Not optional
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        // Optional dependency (should be skipped)
+        packages.insert("node_modules/optional-pkg".to_string(), LockPackage {
+            name: Some("is-number".to_string()),
+            version: Some("7.0.0".to_string()),
+            resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
+            integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
+            shasum: None,
+            license: None,
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
+            requires: None,
+            bin: None,
+            peer: None,
+            dev: None,
+            optional: Some(true),  // This is optional
+            has_install_script: None,
+            workspaces: None,
+        });
+
+        let lock = PackageLock {
+            name: "test-project".to_string(),
+            version: "1.0.0".to_string(),
+            lockfile_version: 3,
+            requires: true,
+            packages,
+            dependencies: None,
+        };
+
+        // Install with omit optional
+        let result = install(&lock, Some(InstallOptions {
+            max_concurrent_downloads: None,
+            omit: vec![OmitType::Optional],
+        })).await;
+        assert!(result.is_ok(), "install failed: {:?}", result.err());
+
+        // Verify required-pkg was installed
+        let required_link = tokio_fs_ext::read_to_string("node_modules/required-pkg/fuse.link").await;
+        assert!(required_link.is_ok(), "required-pkg should be installed");
+
+        // Verify optional-pkg was NOT installed
+        let optional_link = tokio_fs_ext::read_to_string("node_modules/optional-pkg/fuse.link").await;
+        assert!(optional_link.is_err(), "optional-pkg should be skipped");
     }
 }
