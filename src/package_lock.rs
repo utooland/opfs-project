@@ -25,6 +25,10 @@ pub struct LockPackage {
     #[serde(rename = "hasInstallScript")]
     pub has_install_script: Option<bool>,
     pub workspaces: Option<Vec<String>>,
+    /// OS constraints (e.g., ["darwin", "win32"])
+    pub os: Option<serde_json::Value>,
+    /// CPU constraints (e.g., ["arm64", "x64"])
+    pub cpu: Option<serde_json::Value>,
 }
 
 impl LockPackage {
