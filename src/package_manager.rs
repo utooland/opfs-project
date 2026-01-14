@@ -428,41 +428,13 @@ mod tests {
         packages.insert("".to_string(), LockPackage {
             name: Some("test-project".to_string()),
             version: Some("1.0.0".to_string()),
-            resolved: None,
-            integrity: None,
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
+            ..Default::default()
         });
         // Package without resolved (should be skipped with warning)
         packages.insert("node_modules/no-resolved-pkg".to_string(), LockPackage {
             name: Some("no-resolved-pkg".to_string()),
             version: Some("1.0.0".to_string()),
-            resolved: None,
-            integrity: None,
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
+            ..Default::default()
         });
 
         let lock = PackageLock {
@@ -492,40 +464,14 @@ mod tests {
         packages.insert("".to_string(), LockPackage {
             name: Some("test-project".to_string()),
             version: Some("1.0.0".to_string()),
-            resolved: None,
-            integrity: None,
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
+            ..Default::default()
         });
         packages.insert("node_modules/is-number".to_string(), LockPackage {
             name: Some("is-number".to_string()),
             version: Some("7.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
             integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
+            ..Default::default()
         });
 
         let lock = PackageLock {
@@ -563,21 +509,7 @@ mod tests {
         packages.insert("".to_string(), LockPackage {
             name: Some("test-project".to_string()),
             version: Some("1.0.0".to_string()),
-            resolved: None,
-            integrity: None,
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
+            ..Default::default()
         });
         // Same package at two locations (should deduplicate download)
         packages.insert("node_modules/is-number".to_string(), LockPackage {
@@ -585,38 +517,14 @@ mod tests {
             version: Some("7.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
             integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
+            ..Default::default()
         });
         packages.insert("node_modules/other/node_modules/is-number".to_string(), LockPackage {
             name: Some("is-number".to_string()),
             version: Some("7.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
             integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
+            ..Default::default()
         });
 
         let lock = PackageLock {
@@ -656,23 +564,7 @@ mod tests {
         packages.insert("".to_string(), LockPackage {
             name: Some("test-project".to_string()),
             version: Some("1.0.0".to_string()),
-            resolved: None,
-            integrity: None,
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-            os: None,
-            cpu: None,
+            ..Default::default()
         });
 
         // Production dependency
@@ -681,21 +573,7 @@ mod tests {
             version: Some("7.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
             integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,  // Not a dev dependency
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-            os: None,
-            cpu: None,
+            ..Default::default()
         });
 
         // Dev dependency (should be skipped)
@@ -704,21 +582,8 @@ mod tests {
             version: Some("7.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
             integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: Some(true),  // This is a dev dependency
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-            os: None,
-            cpu: None,
+            dev: Some(true),
+            ..Default::default()
         });
 
         let lock = PackageLock {
@@ -760,23 +625,7 @@ mod tests {
         packages.insert("".to_string(), LockPackage {
             name: Some("test-project".to_string()),
             version: Some("1.0.0".to_string()),
-            resolved: None,
-            integrity: None,
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-            os: None,
-            cpu: None,
+            ..Default::default()
         });
 
         // Required dependency
@@ -785,21 +634,7 @@ mod tests {
             version: Some("7.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
             integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,  // Not optional
-            has_install_script: None,
-            workspaces: None,
-            os: None,
-            cpu: None,
+            ..Default::default()
         });
 
         // Optional dependency (should be skipped)
@@ -808,21 +643,8 @@ mod tests {
             version: Some("7.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
             integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: Some(true),  // This is optional
-            has_install_script: None,
-            workspaces: None,
-            os: None,
-            cpu: None,
+            optional: Some(true),
+            ..Default::default()
         });
 
         let lock = PackageLock {
@@ -864,23 +686,7 @@ mod tests {
         packages.insert("".to_string(), LockPackage {
             name: Some("test-project".to_string()),
             version: Some("1.0.0".to_string()),
-            resolved: None,
-            integrity: None,
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-            os: None,
-            cpu: None,
+            ..Default::default()
         });
 
         // Normal dependency (should be installed)
@@ -889,21 +695,7 @@ mod tests {
             version: Some("7.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
             integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-            os: None,
-            cpu: None,
+            ..Default::default()
         });
 
         // Optional dependency with platform constraints (should be skipped even without --omit optional)
@@ -912,21 +704,10 @@ mod tests {
             version: Some("0.15.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/is-number/-/is-number-7.0.0.tgz".to_string()),
             integrity: Some("sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==".to_string()),
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
             optional: Some(true),
-            has_install_script: None,
-            workspaces: None,
             os: Some(serde_json::json!(["darwin"])),
             cpu: Some(serde_json::json!(["arm64"])),
+            ..Default::default()
         });
 
         let lock = PackageLock {
