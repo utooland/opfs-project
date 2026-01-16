@@ -33,6 +33,15 @@ pub async fn install_deps(package_lock: &str, max_concurrent_downloads: usize) -
     let mut tgz_groups: HashMap<String, TgzGroup> = HashMap::new();
 
     for (path, pkg) in lock.packages.iter().filter(|(path, _)| !path.is_empty()) {
+        // Skip optional packages with platform constraints (os/cpu)
+        // These are platform-specific binaries that won't work in WASM environment
+        if pkg.optional == Some(true) && (pkg.os.is_some() || pkg.cpu.is_some()) {
+            let name = pkg.get_name(path);
+            let version = pkg.get_version();
+            tracing::debug!("{}@{}: skipped (optional with platform constraints)", name, version);
+            continue;
+        }
+
         let name = pkg.get_name(path);
         let version = pkg.get_version();
         let tgz_url = match &pkg.resolved {
@@ -444,48 +453,22 @@ mod tests {
         let mut packages = std::collections::HashMap::new();
 
         // Root package
-        let root_package = LockPackage {
+        packages.insert("".to_string(), LockPackage {
             name: Some("test-project".to_string()),
             version: Some("1.0.0".to_string()),
-            resolved: None,
-            integrity: None,
-            shasum: None,
-            license: None,
             dependencies: Some(std::collections::HashMap::new()),
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-        };
-        packages.insert("".to_string(), root_package);
+            ..Default::default()
+        });
 
         // Test dependency
-        let test_package = LockPackage {
+        packages.insert("node_modules/lodash".to_string(), LockPackage {
             name: Some("lodash".to_string()),
             version: Some("4.17.21".to_string()),
             resolved: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
             integrity: Some("sha512-/2U81OjsGkbyk2+ThmuxvWcDrfj8q+I+evwve1/49eHGH9bLjjPKFmy6Hmyac1Wg4nW/brXyT3dD9zdLv5L8Ug==".to_string()),
             shasum: Some("fb5dfc0a2ba5a90ee053c813d71f16e6b66ac994".to_string()),
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-        };
-        packages.insert("node_modules/lodash".to_string(), test_package);
+            ..Default::default()
+        });
 
         PackageLock {
             name: "test-project".to_string(),
@@ -714,28 +697,12 @@ mod tests {
 
         let mut lock = create_test_package_lock();
         lock.packages.clear();
-        lock.packages.insert(
-            "".to_string(),
-            LockPackage {
-                name: Some("empty-project".to_string()),
-                version: Some("1.0.0".to_string()),
-                resolved: None,
-                integrity: None,
-                shasum: None,
-                license: None,
-                dependencies: Some(std::collections::HashMap::new()),
-                dev_dependencies: None,
-                peer_dependencies: None,
-                optional_dependencies: None,
-                requires: None,
-                bin: None,
-                peer: None,
-                dev: None,
-                optional: None,
-                has_install_script: None,
-                workspaces: None,
-            },
-        );
+        lock.packages.insert("".to_string(), LockPackage {
+            name: Some("empty-project".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(std::collections::HashMap::new()),
+            ..Default::default()
+        });
 
         let lock_json = serde_json::to_string(&lock).unwrap();
 
@@ -827,98 +794,41 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_nested_node_modules_structure() {
-
         set_cwd("/nested-test-project");
         // Create a package lock with three-level nested structure
         let mut packages = std::collections::HashMap::new();
 
         // Root package
-        let root_package = LockPackage {
+        packages.insert("".to_string(), LockPackage {
             name: Some("nested-test-project".to_string()),
             version: Some("1.0.0".to_string()),
-            resolved: None,
-            integrity: None,
-            shasum: None,
-            license: None,
             dependencies: Some(std::collections::HashMap::new()),
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-        };
-        packages.insert("".to_string(), root_package);
+            ..Default::default()
+        });
 
         // Level 1: lodash
-        let lodash_package = LockPackage {
+        packages.insert("node_modules/lodash".to_string(), LockPackage {
             name: Some("lodash".to_string()),
             version: Some("4.17.21".to_string()),
             resolved: Some("https://registry.npmmirror.com/lodash/-/lodash-4.17.21.tgz".to_string()),
-            integrity: None,  // No integrity check for this test
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-        };
-        packages.insert("node_modules/lodash".to_string(), lodash_package);
+            ..Default::default()
+        });
 
         // Level 2: lodash.has (dependency of lodash)
-        let lodash_has_package = LockPackage {
+        packages.insert("node_modules/lodash/node_modules/lodash.has".to_string(), LockPackage {
             name: Some("lodash.has".to_string()),
             version: Some("4.5.2".to_string()),
             resolved: Some("https://registry.npmmirror.com/lodash.has/-/lodash.has-4.5.2.tgz".to_string()),
-            integrity: None,  // No integrity check for this test
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-        };
-        packages.insert("node_modules/lodash/node_modules/lodash.has".to_string(), lodash_has_package);
+            ..Default::default()
+        });
 
         // Level 3: deep-strict (dependency of lodash.has)
-        let deep_strict_package = LockPackage {
+        packages.insert("node_modules/lodash/node_modules/lodash.has/node_modules/deep-strict".to_string(), LockPackage {
             name: Some("deep-strict".to_string()),
             version: Some("1.0.0".to_string()),
             resolved: Some("https://registry.npmmirror.com/lodash.chunk/-/lodash.chunk-4.2.0.tgz".to_string()),
-            integrity: None,  // No integrity check for this test
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-        };
-        packages.insert("node_modules/lodash/node_modules/lodash.has/node_modules/deep-strict".to_string(), deep_strict_package);
+            ..Default::default()
+        });
 
         let lock = PackageLock {
             name: "nested-test-project".to_string(),
@@ -1280,70 +1190,28 @@ mod tests {
         let mut packages = std::collections::HashMap::new();
 
         // Root package
-        let root_package = LockPackage {
+        packages.insert("".to_string(), LockPackage {
             name: Some("mixed-test-project".to_string()),
             version: Some("1.0.0".to_string()),
-            resolved: None,
-            integrity: None,
-            shasum: None,
-            license: None,
             dependencies: Some(std::collections::HashMap::new()),
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-        };
-        packages.insert("".to_string(), root_package);
+            ..Default::default()
+        });
 
         // Valid package
-        let valid_package = LockPackage {
+        packages.insert("node_modules/lodash".to_string(), LockPackage {
             name: Some("lodash".to_string()),
             version: Some("4.17.21".to_string()),
             resolved: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
-            integrity: None,  // No integrity check for this test
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-        };
-        packages.insert("node_modules/lodash".to_string(), valid_package);
+            ..Default::default()
+        });
 
         // Invalid package (no resolved field)
-        let invalid_package = LockPackage {
+        packages.insert("node_modules/invalid-package".to_string(), LockPackage {
             name: Some("invalid-package".to_string()),
             version: Some("1.0.0".to_string()),
-            resolved: None, // This will cause an error
-            integrity: None,
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-        };
-        packages.insert("node_modules/invalid-package".to_string(), invalid_package);
+            // resolved: None - will cause an error
+            ..Default::default()
+        });
 
         let lock = PackageLock {
             name: "mixed-test-project".to_string(),
@@ -1449,49 +1317,19 @@ mod tests {
 
         let mut packages = std::collections::HashMap::new();
 
-        // Root package
-        let root_package = LockPackage {
+        packages.insert("".to_string(), LockPackage {
             name: Some("test-marker-dir".to_string()),
             version: Some("1.0.0".to_string()),
-            resolved: None,
-            integrity: None,
-            shasum: None,
-            license: None,
             dependencies: Some(std::collections::HashMap::new()),
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-        };
-        packages.insert("".to_string(), root_package);
+            ..Default::default()
+        });
 
-        // Test package with valid URL
-        let test_package = LockPackage {
+        packages.insert("node_modules/test-pkg".to_string(), LockPackage {
             name: Some("test-pkg".to_string()),
             version: Some("1.0.0".to_string()),
             resolved: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
-            integrity: None,  // No integrity check for this test
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-        };
-        packages.insert("node_modules/test-pkg".to_string(), test_package);
+            ..Default::default()
+        });
 
         let lock = PackageLock {
             name: "test-marker-dir".to_string(),
@@ -1541,49 +1379,19 @@ mod tests {
 
         let mut packages = std::collections::HashMap::new();
 
-        // Root package
-        let root_package = LockPackage {
+        packages.insert("".to_string(), LockPackage {
             name: Some("test-dir-file".to_string()),
             version: Some("1.0.0".to_string()),
-            resolved: None,
-            integrity: None,
-            shasum: None,
-            license: None,
             dependencies: Some(std::collections::HashMap::new()),
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-        };
-        packages.insert("".to_string(), root_package);
+            ..Default::default()
+        });
 
-        // Test package with valid URL
-        let test_package = LockPackage {
+        packages.insert("node_modules/test-pkg2".to_string(), LockPackage {
             name: Some("test-pkg2".to_string()),
             version: Some("1.0.0".to_string()),
             resolved: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
-            integrity: None,  // No integrity check for this test
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
-        };
-        packages.insert("node_modules/test-pkg2".to_string(), test_package);
+            ..Default::default()
+        });
 
         let lock = PackageLock {
             name: "test-dir-file".to_string(),
@@ -1814,25 +1622,11 @@ mod tests {
 
         let mut packages = std::collections::HashMap::new();
 
-        // Root package
         packages.insert("".to_string(), LockPackage {
             name: Some("test-project".to_string()),
             version: Some("1.0.0".to_string()),
-            resolved: None,
-            integrity: None,
-            shasum: None,
-            license: None,
             dependencies: Some(std::collections::HashMap::new()),
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
+            ..Default::default()
         });
 
         // Location 1: node_modules/a/node_modules/lodash
@@ -1840,20 +1634,7 @@ mod tests {
             name: Some("lodash".to_string()),
             version: Some("4.17.21".to_string()),
             resolved: Some(tgz_url.to_string()),
-            integrity: None,
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
+            ..Default::default()
         });
 
         // Location 2: node_modules/b/node_modules/lodash (same tgz URL)
@@ -1861,20 +1642,7 @@ mod tests {
             name: Some("lodash".to_string()),
             version: Some("4.17.21".to_string()),
             resolved: Some(tgz_url.to_string()),
-            integrity: None,
-            shasum: None,
-            license: None,
-            dependencies: None,
-            dev_dependencies: None,
-            peer_dependencies: None,
-            optional_dependencies: None,
-            requires: None,
-            bin: None,
-            peer: None,
-            dev: None,
-            optional: None,
-            has_install_script: None,
-            workspaces: None,
+            ..Default::default()
         });
 
         let lock = PackageLock {
