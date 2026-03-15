@@ -118,14 +118,18 @@ pub(crate) async fn install(
         }
     }
 
-    // 3. Create fuse links for cached packages
+    // 3. Create fuse links for cached packages + warm caches
     for (tgz_path, targets) in &cached {
         for target in targets {
             let dst = std::path::PathBuf::from(target);
             fuse.create_fuse_link(tgz_path, &dst, Some("package"))
                 .await
                 .map_err(|e| OpfsError::Other(format!("fuse link for {target}: {e}")))?;
+            // Pre-populate link cache (avoids disk IO on cold read)
+            fuse.warm_link_cache(&dst, tgz_path, Some("package"));
         }
+        // Eagerly extract all files to disk cache
+        let _ = fuse.eager_extract_tgz(tgz_path).await;
     }
 
     // 4. Download and link the rest
@@ -161,7 +165,9 @@ pub(crate) async fn install(
                 fuse.create_fuse_link(&tgz_path, &dst, Some("package"))
                     .await
                     .map_err(|e| OpfsError::Other(format!("fuse link for {target}: {e}")))?;
+                fuse.warm_link_cache(&dst, &tgz_path, Some("package"));
             }
+            let _ = fuse.eager_extract_tgz(&tgz_path).await;
         }
     }
 

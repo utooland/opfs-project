@@ -233,6 +233,53 @@ impl FuseFs {
         }
     }
 
+    /// Pre-populate the link cache for a known fuse link (avoids disk IO on cold read).
+    ///
+    /// Called during install after `create_fuse_link` to ensure the cache is warm.
+    pub fn warm_link_cache(&self, dst: &Path, tgz_path: &Path, prefix: Option<&str>) {
+        let Some(fuse_link_path) = locate_fuse_link_file(dst) else {
+            return;
+        };
+        let link = Arc::new(FuseLink {
+            tgz_path: tgz_path.to_path_buf(),
+            prefix: prefix.map(String::from),
+        });
+        if let Ok(mut cache) = self.link_cache.write() {
+            cache.insert(fuse_link_path, link);
+        }
+    }
+
+    /// Eagerly extract all files from a tgz to the disk cache.
+    ///
+    /// Called during install so that cold-start reads go straight to disk,
+    /// bypassing tgz decompression entirely.
+    pub async fn eager_extract_tgz(&self, tgz_path: &Path) -> Result<()> {
+        self.ensure_tgz_cached(tgz_path).await?;
+
+        // Collect file list under read lock, then drop lock before IO
+        let files: Vec<(String, Bytes)> = {
+            let idx = self.tar_index.read().map_err(|e| {
+                warn!("tar index read lock poisoned: {e}");
+                Error::other("tar index lock poisoned")
+            })?;
+            idx.all_files(tgz_path)
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        };
+
+        for (name, content) in &files {
+            let disk_path = Self::unpacked_path(tgz_path, name);
+            Self::write_disk_cache(&disk_path, content).await;
+        }
+
+        if !files.is_empty() {
+            self.mark_unpacked(tgz_path);
+        }
+
+        Ok(())
+    }
+
     /// Clear both the tar index and the fuse-link cache.
     pub fn clear(&self) {
         if let Ok(mut idx) = self.tar_index.write() {
@@ -473,38 +520,46 @@ struct Resolved {
 // ── path helpers ─────────────────────────────────────────────────────────
 
 /// Walk up from `path` to find the `node_modules/<pkg>/fuse.link` path.
+///
+/// Zero-allocation on the hot path — only allocates the result PathBuf.
 fn locate_fuse_link_file(path: &Path) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    use std::path::Component;
+
     // Fast path: if the path doesn't contain "node_modules", there's no fuse link.
     if !path.to_string_lossy().contains("node_modules") {
         return None;
     }
 
-    let mut current = path;
-    let mut components: (String, String) = (String::new(), String::new());
+    let node_modules = OsStr::new("node_modules");
+    let components: Vec<_> = path.components().collect();
 
-    while let Some(parent) = current.parent() {
-        if let Some(name) = current.file_name() {
-            let name_str = name.to_string_lossy().to_string();
-            components = (name_str, components.0);
-
-            if parent.file_name().is_some_and(|n| n == "node_modules") {
-                if components.0.is_empty() {
-                    // continue
-                } else if components.0.starts_with('@') {
-                    if !components.1.is_empty() {
-                        return Some(
-                            parent
-                                .join(&components.0)
-                                .join(&components.1)
-                                .join("fuse.link"),
-                        );
-                    }
-                } else {
-                    return Some(parent.join(&components.0).join("fuse.link"));
-                }
-            }
+    // Walk components looking for node_modules, then extract pkg name
+    for (i, comp) in components.iter().enumerate() {
+        let Component::Normal(name) = comp else {
+            continue;
+        };
+        if *name != node_modules {
+            continue;
         }
-        current = parent;
+
+        // i is index of "node_modules", next component is package name
+        let Some(Component::Normal(pkg)) = components.get(i + 1) else {
+            continue;
+        };
+
+        let pkg_str = pkg.to_string_lossy();
+        if pkg_str.starts_with('@') {
+            // Scoped: node_modules/@scope/pkg/...
+            if let Some(Component::Normal(scope_pkg)) = components.get(i + 2) {
+                let base: PathBuf = components[..=i].iter().collect();
+                return Some(base.join(pkg).join(scope_pkg).join("fuse.link"));
+            }
+        } else {
+            // Unscoped: node_modules/pkg/...
+            let base: PathBuf = components[..=i].iter().collect();
+            return Some(base.join(pkg).join("fuse.link"));
+        }
     }
     None
 }
