@@ -532,33 +532,46 @@ fn locate_fuse_link_file(path: &Path) -> Option<PathBuf> {
     }
 
     let node_modules = OsStr::new("node_modules");
-    let components: Vec<_> = path.components().collect();
 
-    // Walk components looking for node_modules, then extract pkg name
-    for (i, comp) in components.iter().enumerate() {
-        let Component::Normal(name) = comp else {
-            continue;
-        };
-        if *name != node_modules {
-            continue;
-        }
+    // We only care about the last `node_modules` in the path.
+    // e.g. /a/node_modules/b/node_modules/pkg/src/index.js -> we want `pkg`
+    let mut comps = path.components();
+    let mut pkg_components: Vec<&OsStr> = Vec::new();
 
-        // i is index of "node_modules", next component is package name
-        let Some(Component::Normal(pkg)) = components.get(i + 1) else {
-            continue;
-        };
-
-        let pkg_str = pkg.to_string_lossy();
-        if pkg_str.starts_with('@') {
-            // Scoped: node_modules/@scope/pkg/...
-            if let Some(Component::Normal(scope_pkg)) = components.get(i + 2) {
-                let base: PathBuf = components[..=i].iter().collect();
-                return Some(base.join(pkg).join(scope_pkg).join("fuse.link"));
+    // Iterate backwards. As soon as we hit `node_modules`, the components we
+    // just traversed *must* contain the package name at the front.
+    while let Some(comp) = comps.next_back() {
+        if let Component::Normal(name) = comp {
+            if name == node_modules {
+                // We found `node_modules`. Now look at the components that came after it.
+                // Because we traversed backwards, pkg_components is reversed.
+                // The actual package name is at the *end* of pkg_components.
+                if let Some(pkg) = pkg_components.last().copied() {
+                    let pkg_str = pkg.to_string_lossy();
+                    if pkg_str.starts_with('@') {
+                        // Scoped: it needs 2 components (@scope and pkg name)
+                        if pkg_components.len() >= 2 {
+                            let scope = pkg;
+                            let name = pkg_components[pkg_components.len() - 2];
+                            let mut base = comps.as_path().to_path_buf();
+                            base.push("node_modules");
+                            base.push(scope);
+                            base.push(name);
+                            base.push("fuse.link");
+                            return Some(base);
+                        }
+                    } else {
+                        // Unscoped: 1 component
+                        let mut base = comps.as_path().to_path_buf();
+                        base.push("node_modules");
+                        base.push(pkg);
+                        base.push("fuse.link");
+                        return Some(base);
+                    }
+                }
+            } else {
+                pkg_components.push(name);
             }
-        } else {
-            // Unscoped: node_modules/pkg/...
-            let base: PathBuf = components[..=i].iter().collect();
-            return Some(base.join(pkg).join("fuse.link"));
         }
     }
     None
