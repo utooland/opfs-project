@@ -1,101 +1,37 @@
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
-use std::{
-    io::Result,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+//! opfs-project — OPFS filesystem with fuse-link indirection and
+//! lazy package installation for WASM applications.
+//!
+//! # Quick start
+//!
+//! ```ignore
+//! use opfs_project::{OpfsProject, Config};
+//!
+//! let project = OpfsProject::new(Config::default());
+//! let bytes = project.read("node_modules/foo/index.js").await?;
+//! ```
 
-mod fuse;
+// ── modules ──────────────────────────────────────────────────────────────
+
+pub mod archive;
+pub mod config;
+pub mod error;
+pub mod fuse_fs;
 pub mod package_lock;
 pub mod package_manager;
-pub mod pack;
-pub mod tar_cache;
-mod util;
+pub mod project;
+pub mod store;
+pub mod tar_index;
 
-pub use tokio_fs_ext::DirEntry;
+// ── re-exports ───────────────────────────────────────────────────────────
 
-pub use package_manager::{install, InstallOptions, OmitType};
+pub use config::Config;
+pub use error::{OpfsError, VerifyResult};
+pub use package_manager::{InstallOptions, OmitType};
+pub use project::OpfsProject;
 
-/// Read file content with fuse.link support
-pub async fn read<P: AsRef<Path>>(path: P) -> Result<Arc<Vec<u8>>> {
-    let path_ref = path.as_ref();
-    let prepared_path = crate::util::prepare_path(path_ref);
-
-    // Try to read through node_modules fuse link logic first
-    if let Some(content) = fuse::try_read_through_fuse_link(&prepared_path).await? {
-        return Ok(content);
-    }
-
-    // Fallback to direct read
-    let content = tokio_fs_ext::read(&prepared_path).await?;
-    Ok(Arc::new(content))
-}
-
-/// Read directory contents with file type information and fuse.link support
-pub async fn read_dir<P: AsRef<Path>>(path: P) -> Result<Vec<tokio_fs_ext::DirEntry>> {
-    let path_ref = path.as_ref();
-    let prepared_path = crate::util::prepare_path(path_ref);
-
-    // Handle node_modules fuse.link logic
-    if let Some(entries) = fuse::try_read_dir_through_fuse_link(&prepared_path).await? {
-        return Ok(entries);
-    }
-
-    // Handle direct directory reading
-    let entries = crate::util::read_dir_direct(&prepared_path).await?;
-    Ok(entries)
-}
-
-pub async fn write(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> Result<()> {
-    // TODO: try fuse link first
-    tokio_fs_ext::write(path, content).await
-}
-
-pub async fn create_dir(path: impl AsRef<Path>) -> Result<()> {
-    // TODO: try fuse link first
-    tokio_fs_ext::create_dir(path).await
-}
-
-pub async fn create_dir_all(path: impl AsRef<Path>) -> Result<()> {
-    // TODO: try fuse link first
-    tokio_fs_ext::create_dir_all(path).await
-}
-
-pub async fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<u64> {
-    // TODO: try fuse link first
-    tokio_fs_ext::copy(from, to).await
-}
-
-pub async fn remove_file(path: impl AsRef<Path>) -> Result<()> {
-    // TODO: try fuse link first
-    tokio_fs_ext::remove_file(path).await
-}
-
-pub async fn remove_dir(path: impl AsRef<Path>) -> Result<()> {
-    // TODO: try fuse link first
-    tokio_fs_ext::remove_dir(path).await
-}
-
-pub async fn remove_dir_all(path: impl AsRef<Path>) -> Result<()> {
-    // TODO: try fuse link first
-    tokio_fs_ext::remove_dir_all(path).await
-}
-
-pub async fn metadata(path: impl AsRef<Path>) -> Result<tokio_fs_ext::Metadata> {
-    // TODO: try fuse link first
-    tokio_fs_ext::metadata(path).await
-}
-
-/// Set current working directory
-pub fn set_cwd(path: impl AsRef<Path>) {
-    tokio_fs_ext::set_current_dir(path).unwrap();
-}
-
-/// Read current working directory
-pub fn get_cwd() -> PathBuf {
-    tokio_fs_ext::current_dir().unwrap()
-}
+// ── test utilities ───────────────────────────────────────────────────────
 
 #[cfg(test)]
 pub mod test_utils {
@@ -103,30 +39,23 @@ pub mod test_utils {
 
     static INIT: Once = Once::new();
 
-    /// Initialize tracing-web for tests
-    /// This should be called at the beginning of each test to enable web console logging
+    /// Initialise tracing-web for browser-based tests.
     pub fn init_tracing() {
         INIT.call_once(|| {
-            {
-                use tracing_subscriber::{
-                    fmt::{
-                        self,
-                        format::FmtSpan,
-                    },
-                    layer::SubscriberExt,
-                    registry,
-                    util::SubscriberInitExt,
-                };
+            use tracing_subscriber::{
+                fmt::{self, format::FmtSpan},
+                layer::SubscriberExt,
+                registry,
+                util::SubscriberInitExt,
+            };
+            use tracing_web::MakeWebConsoleWriter;
 
-                use tracing_web::MakeWebConsoleWriter;
-
-                let fmt_layer = fmt::layer()
+            let fmt_layer = fmt::layer()
                 .without_time()
                 .with_span_events(FmtSpan::CLOSE)
                 .with_writer(MakeWebConsoleWriter::new());
 
             registry().with(fmt_layer).init();
-            }
         });
     }
 }
