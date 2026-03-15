@@ -1,58 +1,68 @@
 # OPFS Project
 
-A Rust library for working with the Origin Private File System (OPFS) in WebAssembly applications.
+A Rust library for managing npm-style projects on the Origin Private File System (OPFS) in WebAssembly. Provides lazy tgz extraction via fuse links, a content-addressable store, and zero-copy file reads.
 
 ## Features
 
-- File and directory operations in OPFS
-- Support for fuse.link files to create symbolic links between directories
-- Package management functionality for handling npm-style dependencies
-- Asynchronous API for all file operations
+- **Struct-based API** — all state owned by `OpfsProject` (config, caches, store)
+- **Fuse links** — `fuse.link` files map `node_modules/<pkg>/` to tgz entries in the store, enabling lazy on-demand extraction
+- **Zero-copy reads** — decompressed tar kept as a single `Bytes` buffer; individual files served via `Bytes::slice()` (no per-file allocations)
+- **O(1) lookups** — `is_dir`, `get_file`, `list_dir` all backed by `HashMap`/`HashSet`
+- **LRU cache** — configurable budget for decompressed tar data with automatic eviction
+- **In-flight dedup** — concurrent reads of the same tgz only decompress once
+- **Content-addressable store** — tgz files stored by integrity hash (SHA-512 / SHA-1)
+- **Async I/O** — all file operations are async via `tokio-fs-ext`
 
-## Use Cases
+## Architecture
 
-- Web applications that need persistent local storage
-- Package managers for web-based development environments
-- Applications that need to manage complex file structures in the browser
-- Tools that require fast access to local files without user interaction
+```
+OpfsProject
+├── Config         — store root, cache budgets, download settings
+├── FuseFs         — fuse-link resolution + tar index
+│   ├── link_cache — PathBuf → Arc<FuseLink> (LRU)
+│   └── tar_index  — PathBuf → TgzEntry (LRU, zero-copy Bytes)
+└── Store          — download, verify (sha512/sha1), save tgz
+```
 
-## Development Setup
+## Usage
 
-1. Install Rust and Cargo
-2. Install wasm-pack: `cargo install wasm-pack`
-3. Build the project: `wasm-pack build`
-4. Run tests: `wasm-pack test --chrome --headless`
+```rust
+use opfs_project::{OpfsProject, Config};
 
-## API
+// Create with defaults
+let project = OpfsProject::default();
 
-### File Operations
+// Or customise
+let project = OpfsProject::new(Config {
+    store_root: "/my-store".into(),
+    tar_cache_max_bytes: 200 * 1024 * 1024, // 200MB
+    ..Config::default()
+});
 
-- `opfs::read_dir(path)` - Read directory contents
-- `opfs::read(path)` - Read file contents
-- `opfs::write(path, content)` - Write content to file
-- `opfs::create_dir_all(path)` - Create directory and all parent directories
-- `opfs::remove(path)` - Remove a file
-- `opfs::exists(path)` - Check if file or directory exists
+// Fuse-aware reads (transparent tgz extraction under node_modules)
+let content = project.read("node_modules/react/index.js").await?;
+let entries = project.read_dir("node_modules/react/lib").await?;
 
-### Package Management
-
-- `package_manager::install_deps(package_lock, max_concurrent_downloads)` - Install dependencies from package-lock.json with specified concurrency limit
-
-### Fuse Link Operations
-
-- `fuse::fuse_link(src, dst)` - Create fuse link between source and destination directories
-- `fuse::read(path)` - Read file content with fuse.link support
-- `fuse::read_dir(path)` - Read directory contents with fuse.link support
+// Install from package-lock.json
+use opfs_project::package_lock::PackageLock;
+let lock = PackageLock::from_json(json_str)?;
+project.install(&lock, &Default::default()).await?;
+```
 
 ## Testing
 
-Tests are written using wasm-bindgen-test and can be run with:
-
 ```bash
-wasm-pack test --chrome --headless
-```
+# native tests
+cargo test
 
-Note: Tests require a modern browser with OPFS support (Firefox 116+, Chrome 114+).
+# wasm tests (requires chromedriver)
+brew install --cask chromedriver  # macOS
+CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown
+
+# interactive wasm tests
+brew install wasm-pack
+wasm-pack test --chrome
+```
 
 ## License
 
