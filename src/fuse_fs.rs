@@ -90,6 +90,9 @@ impl FuseLink {
     }
 }
 
+/// Max concurrent OPFS writes during tgz extraction.
+const EXTRACTION_CONCURRENCY: usize = 32;
+
 // ── FuseFs ───────────────────────────────────────────────────────────────
 
 /// Fuse-link aware filesystem overlay.
@@ -271,7 +274,7 @@ impl FuseFs {
                     let _ = tokio_fs_ext::write(&path, &content).await;
                 }
             })
-            .buffer_unordered(32)
+            .buffer_unordered(EXTRACTION_CONCURRENCY)
             .collect::<Vec<()>>()
             .await;
 
@@ -491,7 +494,8 @@ struct Resolved {
 
 /// Walk up from `path` to find the `node_modules/<pkg>/fuse.link` path.
 ///
-/// Zero-allocation on the hot path — only allocates the result PathBuf.
+/// Low-allocation: uses a small `Vec<&OsStr>` for component tracking,
+/// only allocates the final `PathBuf` result.
 fn locate_fuse_link_file(path: &Path) -> Option<PathBuf> {
     use std::ffi::OsStr;
     use std::path::Component;
