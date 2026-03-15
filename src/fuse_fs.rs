@@ -342,34 +342,58 @@ impl FuseFs {
     }
 
     /// Extract a single file from a tgz.
+    ///
+    /// Lookup order:
+    /// 1. Disk cache (unpacked file alongside the tgz) — persists across sessions
+    /// 2. In-memory tar index — fastest, but session-scoped
+    /// 3. Decompress tgz → populate tar index → write file to disk cache
     async fn extract_file(&self, tgz_path: &Path, file_path: &Path) -> Result<Bytes> {
         let lossy = file_path.to_string_lossy();
         let normalized = tar_index::strip_first(&lossy);
 
-        // Try cache first — read lock only
-        {
+        // Derive disk cache path: /stores/.../pkg.tgz → /stores/.../pkg/index.js
+        let disk_path = Self::unpacked_path(tgz_path, normalized);
+
+        // 1. Try disk cache (persists across page reloads)
+        match tokio_fs_ext::read(&disk_path).await {
+            Ok(data) => return Ok(Bytes::from(data)),
+            Err(e) if e.kind() == ErrorKind::NotFound => {} // expected miss
+            Err(_) => {}                                    // OPFS type mismatch etc.
+        }
+
+        // 2. Try in-memory tar index
+        let from_index = {
             let idx = self.tar_index.read().map_err(|e| {
                 warn!("tar index read lock poisoned: {e}");
                 Error::other("tar index lock poisoned")
             })?;
-            if let Some(content) = idx.get_file(tgz_path, normalized) {
-                return Ok(content);
-            }
-        }
-
-        // Cache miss — load tgz, then retry
-        self.ensure_tgz_cached(tgz_path).await?;
-
-        let idx = self.tar_index.read().map_err(|e| {
-            warn!("tar index read lock poisoned: {e}");
-            Error::other("tar index lock poisoned")
-        })?;
-
-        if let Some(content) = idx.get_file(tgz_path, normalized) {
+            idx.get_file(tgz_path, normalized)
+        };
+        if let Some(content) = from_index {
+            Self::write_disk_cache(&disk_path, &content).await;
             return Ok(content);
         }
 
-        if idx.is_dir_in_tgz(tgz_path, normalized) {
+        // 3. Cache miss — load tgz, then retry
+        self.ensure_tgz_cached(tgz_path).await?;
+
+        let (content, is_dir) = {
+            let idx = self.tar_index.read().map_err(|e| {
+                warn!("tar index read lock poisoned: {e}");
+                Error::other("tar index lock poisoned")
+            })?;
+            (
+                idx.get_file(tgz_path, normalized),
+                idx.is_dir_in_tgz(tgz_path, normalized),
+            )
+        };
+
+        if let Some(content) = content {
+            Self::write_disk_cache(&disk_path, &content).await;
+            return Ok(content);
+        }
+
+        if is_dir {
             return Err(Error::new(
                 ErrorKind::IsADirectory,
                 format!("{} is a directory", file_path.display()),
@@ -384,6 +408,22 @@ impl FuseFs {
                 tgz_path.display()
             ),
         ))
+    }
+
+    /// Derive the unpacked disk cache path from tgz path + file name.
+    ///
+    /// `/stores/pkg.tgz` + `index.js` → `/stores/pkg/index.js`
+    fn unpacked_path(tgz_path: &Path, normalized: &str) -> PathBuf {
+        let stem = tgz_path.with_extension(""); // strip .tgz
+        stem.join(normalized)
+    }
+
+    /// Best-effort write to disk cache. Errors are silently ignored.
+    async fn write_disk_cache(path: &Path, content: &[u8]) {
+        if let Some(parent) = path.parent() {
+            let _ = tokio_fs_ext::create_dir_all(parent).await;
+        }
+        let _ = tokio_fs_ext::write(path, content).await;
     }
 
     /// List directory contents from a cached tgz.
