@@ -12,16 +12,37 @@ A Rust library for managing npm-style projects on the Origin Private File System
 - **In-flight dedup** — concurrent reads of the same tgz only decompress once
 - **Content-addressable store** — tgz files stored by integrity hash (SHA-512 / SHA-1)
 - **Async I/O** — all file operations are async via `tokio-fs-ext`
+- **Lazy / non-lazy tgz mode** — configurable via `Config::lazy_tgz`
 
 ## Architecture
 
 ```
 OpfsProject
-├── Config         — store root, cache budgets, download settings
+├── Config         — store root, cache budgets, lazy_tgz toggle
 ├── FuseFs         — fuse-link resolution + tar index
 │   ├── link_cache — PathBuf → Arc<FuseLink> (LRU)
 │   └── tar_index  — PathBuf → TgzEntry (LRU, zero-copy Bytes)
 └── Store          — download, verify (sha512/sha1), save tgz
+```
+
+### Read path (lazy_tgz = true, default)
+
+```
+read("node_modules/pkg/index.js")
+  → locate_fuse_link_file()       zero-alloc path walk
+  → read_fuse_link()              cache hit: Arc::clone (no IO)
+  → extract_file()
+      1. tar_index.get_file()     O(1), Bytes::slice(), zero IO
+      2. ensure_tgz_cached()      decompress tgz on first access
+```
+
+### Read path (lazy_tgz = false)
+
+```
+read("node_modules/pkg/index.js")
+  → locate_fuse_link_file()       zero-alloc path walk
+  → read_fuse_link()              cache hit: Arc::clone (no IO)
+  → tokio_fs_ext::read(dir/relative)  plain filesystem read
 ```
 
 ## Usage
@@ -29,13 +50,12 @@ OpfsProject
 ```rust
 use opfs_project::{OpfsProject, Config};
 
-// Create with defaults
+// Lazy mode (default) — reads from in-memory tar index
 let project = OpfsProject::default();
 
-// Or customise
+// Non-lazy mode — extracts tgz to real files during install
 let project = OpfsProject::new(Config {
-    store_root: "/my-store".into(),
-    tar_cache_max_bytes: 200 * 1024 * 1024, // 200MB
+    lazy_tgz: false,
     ..Config::default()
 });
 
@@ -48,6 +68,18 @@ use opfs_project::package_lock::PackageLock;
 let lock = PackageLock::from_json(json_str)?;
 project.install(&lock, &Default::default()).await?;
 ```
+
+## Configuration
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `store_root` | `/stores` | Root directory for tgz store |
+| `tar_cache_max_bytes` | 100 MB | In-memory tar index budget |
+| `fuse_cache_max_entries` | 10,000 | Fuse-link path cache capacity |
+| `max_concurrent_downloads` | 20 | Parallel HTTP downloads |
+| `download_retries` | 3 | Retry count for failed downloads |
+| `retry_base_delay_ms` | 500 | Exponential backoff base delay |
+| `lazy_tgz` | `true` | `true`: read from in-memory tar index; `false`: extract to disk during install |
 
 ## Testing
 

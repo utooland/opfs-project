@@ -130,6 +130,22 @@ impl TarIndex {
         self.current_size = 0;
     }
 
+    /// Return all (file_name, content) pairs from a cached tgz.
+    ///
+    /// Used by eager extraction to write all files to disk at once.
+    pub fn all_files(&self, tgz_path: &Path) -> Option<Vec<(String, Bytes)>> {
+        let entry = self.cache.get(tgz_path)?;
+        Some(
+            entry
+                .file_index
+                .iter()
+                .map(|(name, &(offset, len))| {
+                    (name.clone(), entry.tar_data.slice(offset..offset + len))
+                })
+                .collect(),
+        )
+    }
+
     // ── private ──
 
     fn evict_oldest(&mut self) {
