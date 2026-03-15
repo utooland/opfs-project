@@ -413,6 +413,11 @@ struct Resolved {
 
 /// Walk up from `path` to find the `node_modules/<pkg>/fuse.link` path.
 fn locate_fuse_link_file(path: &Path) -> Option<PathBuf> {
+    // Fast path: if the path doesn't contain "node_modules", there's no fuse link.
+    if !path.to_string_lossy().contains("node_modules") {
+        return None;
+    }
+
     let mut current = path;
     let mut components: (String, String) = (String::new(), String::new());
 
