@@ -175,7 +175,6 @@ pub fn parse_tgz(tgz_bytes: &[u8]) -> Result<ParsedTgz> {
     // Step 2: parse tar to build file index (offset + length)
     let mut file_index: HashMap<String, (usize, usize)> = HashMap::new();
     let mut dirs = HashSet::new();
-    let mut total_size = 0usize;
 
     let mut archive = Archive::new(tar_data.as_ref());
     for entry_result in archive.entries()? {
@@ -205,13 +204,15 @@ pub fn parse_tgz(tgz_bytes: &[u8]) -> Result<ParsedTgz> {
 
         let offset = entry.raw_file_position() as usize;
         let size = entry.size() as usize;
-        total_size += size;
         file_index.insert(normalized, (offset, size));
     }
 
     // Step 3: build children index
     let file_names: Vec<&str> = file_index.keys().map(|s| s.as_str()).collect();
     let children = build_children_index(&file_names, &dirs);
+
+    // total_size = decompressed tar buffer size (actual memory consumed)
+    let total_size = tar_data.len();
 
     Ok(ParsedTgz {
         tar_data,

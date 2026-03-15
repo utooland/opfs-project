@@ -274,10 +274,14 @@ impl FuseFs {
             None => return Ok(None),
         };
 
-        // Populate cache — write lock
-        if let Ok(mut cache) = self.link_cache.write()
-            && cache.len() < self.max_link_cache
-        {
+        // Populate cache — write lock (evict half when full, matching create_fuse_link)
+        if let Ok(mut cache) = self.link_cache.write() {
+            if cache.len() >= self.max_link_cache && !cache.contains_key(fuse_link_path) {
+                let to_remove: Vec<_> = cache.keys().take(cache.len() / 2).cloned().collect();
+                for k in to_remove {
+                    cache.remove(&k);
+                }
+            }
             cache.insert(fuse_link_path.to_path_buf(), Arc::clone(&link));
         }
 
