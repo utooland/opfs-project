@@ -10,11 +10,7 @@ use sha2::Sha512;
 
 use crate::error::VerifyResult;
 
-#[cfg(target_arch = "wasm32")]
-use web_time::{SystemTime, UNIX_EPOCH};
-
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::{SystemTime, UNIX_EPOCH};
+use wasmtimer::std::{SystemTime, UNIX_EPOCH};
 
 /// Calculate MD5 hash of byte content (hex-encoded).
 pub fn sig_md5(content: &[u8]) -> String {

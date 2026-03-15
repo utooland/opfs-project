@@ -16,7 +16,7 @@ use bytes::Bytes;
 use flate2::read::GzDecoder;
 use tar::Archive;
 use tokio_fs_ext::{DirEntry, FileType};
-use web_time::Instant;
+use wasmtimer::std::Instant;
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
