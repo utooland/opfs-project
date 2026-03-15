@@ -362,13 +362,12 @@ impl FuseFs {
     /// Extract a single file from a tgz.
     ///
     /// Lookup order (minimises IO):
-    /// 1. In-memory tar index — O(1), zero IO
-    /// 2. Disk cache — only if this tgz is known to have unpacked files
-    /// 3. Decompress tgz → populate tar index → write file to disk cache
+    /// 1. In-memory tar index — O(1), zero IO (hot path)
+    /// 2. Disk cache — only on cold start when tar index is empty
+    /// 3. Decompress tgz → populate tar index + write to disk cache
     async fn extract_file(&self, tgz_path: &Path, file_path: &Path) -> Result<Bytes> {
         let lossy = file_path.to_string_lossy();
         let normalized = tar_index::strip_first(&lossy);
-        let disk_path = Self::unpacked_path(tgz_path, normalized);
 
         // 1. Try in-memory tar index (fastest, no IO)
         let from_index = {
@@ -379,12 +378,11 @@ impl FuseFs {
             idx.get_file(tgz_path, normalized)
         };
         if let Some(content) = from_index {
-            Self::write_disk_cache(&disk_path, &content).await;
-            self.mark_unpacked(tgz_path);
             return Ok(content);
         }
 
         // 2. Try disk cache — only if we know this tgz has unpacked files
+        let disk_path = Self::unpacked_path(tgz_path, normalized);
         if self.is_known_unpacked(tgz_path)
             && let Ok(data) = tokio_fs_ext::read(&disk_path).await
         {
@@ -406,6 +404,7 @@ impl FuseFs {
         };
 
         if let Some(content) = content {
+            // Write-through to disk only after tgz decompress (already expensive)
             Self::write_disk_cache(&disk_path, &content).await;
             self.mark_unpacked(tgz_path);
             return Ok(content);
