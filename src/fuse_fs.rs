@@ -158,7 +158,9 @@ impl FuseFs {
         };
 
         if !resolved.link.is_tgz_mode() {
-            return match tokio_fs_ext::read(&resolved.link.tgz_path).await {
+            // Non-lazy: link points to an extracted directory, join relative path
+            let real_path = resolved.link.tgz_path.join(&resolved.relative);
+            return match tokio_fs_ext::read(&real_path).await {
                 Ok(v) => Ok(Some(Bytes::from(v))),
                 Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e),
@@ -194,7 +196,9 @@ impl FuseFs {
                 .await
                 .ok()
         } else {
-            read_dir_direct(&resolved.link.tgz_path).await.ok()
+            // Non-lazy: link points to an extracted directory, join relative path
+            let real_dir = resolved.link.tgz_path.join(&resolved.relative);
+            read_dir_direct(&real_dir).await.ok()
         };
 
         let Some(target_entries) = target_entries else {
