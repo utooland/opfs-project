@@ -101,6 +101,8 @@ pub struct FuseFs {
     tar_index: RwLock<TarIndex>,
     /// Tgz paths currently being loaded (prevents duplicate decompress).
     loading: RwLock<HashSet<PathBuf>>,
+    /// Tgz paths known to have extracted files on disk (avoids speculative IO).
+    disk_unpacked: RwLock<HashSet<PathBuf>>,
     max_link_cache: usize,
 }
 
@@ -110,8 +112,24 @@ impl FuseFs {
             link_cache: RwLock::new(HashMap::new()),
             tar_index: RwLock::new(TarIndex::new(tar_cache_max_bytes)),
             loading: RwLock::new(HashSet::new()),
+            disk_unpacked: RwLock::new(HashSet::new()),
             max_link_cache: fuse_cache_max_entries,
         }
+    }
+
+    /// Record that a tgz has files extracted to disk.
+    fn mark_unpacked(&self, tgz_path: &Path) {
+        if let Ok(mut set) = self.disk_unpacked.write() {
+            set.insert(tgz_path.to_path_buf());
+        }
+    }
+
+    /// Check if a tgz is known to have files on disk.
+    fn is_known_unpacked(&self, tgz_path: &Path) -> bool {
+        self.disk_unpacked
+            .read()
+            .map(|set| set.contains(tgz_path))
+            .unwrap_or(false)
     }
 
     /// Create a fuse link file on disk and cache the mapping.
@@ -343,25 +361,16 @@ impl FuseFs {
 
     /// Extract a single file from a tgz.
     ///
-    /// Lookup order:
-    /// 1. Disk cache (unpacked file alongside the tgz) — persists across sessions
-    /// 2. In-memory tar index — fastest, but session-scoped
+    /// Lookup order (minimises IO):
+    /// 1. In-memory tar index — O(1), zero IO
+    /// 2. Disk cache — only if this tgz is known to have unpacked files
     /// 3. Decompress tgz → populate tar index → write file to disk cache
     async fn extract_file(&self, tgz_path: &Path, file_path: &Path) -> Result<Bytes> {
         let lossy = file_path.to_string_lossy();
         let normalized = tar_index::strip_first(&lossy);
-
-        // Derive disk cache path: /stores/.../pkg.tgz → /stores/.../pkg/index.js
         let disk_path = Self::unpacked_path(tgz_path, normalized);
 
-        // 1. Try disk cache (persists across page reloads)
-        match tokio_fs_ext::read(&disk_path).await {
-            Ok(data) => return Ok(Bytes::from(data)),
-            Err(e) if e.kind() == ErrorKind::NotFound => {} // expected miss
-            Err(_) => {}                                    // OPFS type mismatch etc.
-        }
-
-        // 2. Try in-memory tar index
+        // 1. Try in-memory tar index (fastest, no IO)
         let from_index = {
             let idx = self.tar_index.read().map_err(|e| {
                 warn!("tar index read lock poisoned: {e}");
@@ -371,7 +380,15 @@ impl FuseFs {
         };
         if let Some(content) = from_index {
             Self::write_disk_cache(&disk_path, &content).await;
+            self.mark_unpacked(tgz_path);
             return Ok(content);
+        }
+
+        // 2. Try disk cache — only if we know this tgz has unpacked files
+        if self.is_known_unpacked(tgz_path)
+            && let Ok(data) = tokio_fs_ext::read(&disk_path).await
+        {
+            return Ok(Bytes::from(data));
         }
 
         // 3. Cache miss — load tgz, then retry
@@ -390,6 +407,7 @@ impl FuseFs {
 
         if let Some(content) = content {
             Self::write_disk_cache(&disk_path, &content).await;
+            self.mark_unpacked(tgz_path);
             return Ok(content);
         }
 
@@ -627,5 +645,46 @@ mod tests {
             link.dir_in_tgz(Path::new("cjs")),
             Some(PathBuf::from("package/cjs"))
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_unpacked_path() {
+        let tgz = Path::new("/stores/registry.npmjs.org/react/-/react-18.2.0.tgz");
+        let disk = FuseFs::unpacked_path(tgz, "index.js");
+        assert_eq!(
+            disk,
+            PathBuf::from("/stores/registry.npmjs.org/react/-/react-18.2.0/index.js")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_unpacked_path_nested() {
+        let tgz = Path::new("/stores/pkg.tgz");
+        let disk = FuseFs::unpacked_path(tgz, "lib/utils/index.js");
+        assert_eq!(disk, PathBuf::from("/stores/pkg/lib/utils/index.js"));
+    }
+
+    #[wasm_bindgen_test]
+    fn test_disk_unpacked_tracking() {
+        let fs = FuseFs::new(100 * 1024 * 1024, 1000);
+        let tgz = Path::new("/stores/foo.tgz");
+
+        assert!(!fs.is_known_unpacked(tgz));
+        fs.mark_unpacked(tgz);
+        assert!(fs.is_known_unpacked(tgz));
+
+        // Different tgz still unknown
+        assert!(!fs.is_known_unpacked(Path::new("/stores/bar.tgz")));
+    }
+
+    #[wasm_bindgen_test]
+    fn test_locate_fuse_link_fast_path_skips_non_node_modules() {
+        // Paths without node_modules should return None immediately
+        assert_eq!(locate_fuse_link_file(Path::new("/src/App.tsx")), None);
+        assert_eq!(
+            locate_fuse_link_file(Path::new("/project/lib/utils.js")),
+            None
+        );
+        assert_eq!(locate_fuse_link_file(Path::new("package.json")), None);
     }
 }
