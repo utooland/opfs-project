@@ -101,8 +101,6 @@ pub struct FuseFs {
     tar_index: RwLock<TarIndex>,
     /// Tgz paths currently being loaded (prevents duplicate decompress).
     loading: RwLock<HashSet<PathBuf>>,
-    /// Tgz paths known to have extracted files on disk (avoids speculative IO).
-    disk_unpacked: RwLock<HashSet<PathBuf>>,
     max_link_cache: usize,
 }
 
@@ -112,24 +110,8 @@ impl FuseFs {
             link_cache: RwLock::new(HashMap::new()),
             tar_index: RwLock::new(TarIndex::new(tar_cache_max_bytes)),
             loading: RwLock::new(HashSet::new()),
-            disk_unpacked: RwLock::new(HashSet::new()),
             max_link_cache: fuse_cache_max_entries,
         }
-    }
-
-    /// Record that a tgz has files extracted to disk.
-    fn mark_unpacked(&self, tgz_path: &Path) {
-        if let Ok(mut set) = self.disk_unpacked.write() {
-            set.insert(tgz_path.to_path_buf());
-        }
-    }
-
-    /// Check if a tgz is known to have files on disk.
-    fn is_known_unpacked(&self, tgz_path: &Path) -> bool {
-        self.disk_unpacked
-            .read()
-            .map(|set| set.contains(tgz_path))
-            .unwrap_or(false)
     }
 
     /// Create a fuse link file on disk and cache the mapping.
@@ -249,13 +231,17 @@ impl FuseFs {
         }
     }
 
-    /// Eagerly extract all files from a tgz to the disk cache.
+    /// Extract all files from a tgz into a real directory on disk.
     ///
-    /// Writes files concurrently to avoid hanging the install process.
-    pub async fn eager_extract_tgz(&self, tgz_path: &Path) -> Result<()> {
+    /// Used by non-lazy mode: after extraction, fuse links point to the
+    /// extracted directory, so reads are plain filesystem reads.
+    ///
+    /// Returns the extraction root directory (tgz path with `.tgz` stripped).
+    pub async fn extract_tgz_to_dir(&self, tgz_path: &Path) -> Result<PathBuf> {
         self.ensure_tgz_cached(tgz_path).await?;
 
-        // Collect file list under read lock, then drop lock before IO
+        let out_dir = tgz_path.with_extension(""); // strip .tgz
+
         let files: Vec<(String, Bytes)> = {
             let idx = self.tar_index.read().map_err(|e| {
                 warn!("tar index read lock poisoned: {e}");
@@ -267,28 +253,25 @@ impl FuseFs {
                 .collect()
         };
 
-        if files.is_empty() {
-            return Ok(());
-        }
-
-        // Write files to disk concurrently
         use futures::stream::{self, StreamExt};
-        let tgz_path_buf = tgz_path.to_path_buf();
+        let out = out_dir.clone();
 
         stream::iter(files)
             .map(|(name, content)| {
-                let t_path = tgz_path_buf.clone();
+                let dir = out.clone();
                 async move {
-                    let disk_path = Self::unpacked_path(&t_path, &name);
-                    Self::write_disk_cache(&disk_path, &content).await;
+                    let path = dir.join(&name);
+                    if let Some(parent) = path.parent() {
+                        let _ = tokio_fs_ext::create_dir_all(parent).await;
+                    }
+                    let _ = tokio_fs_ext::write(&path, &content).await;
                 }
             })
-            .buffer_unordered(32) // Concurrency limit for OPFS writes
+            .buffer_unordered(32)
             .collect::<Vec<()>>()
             .await;
 
-        self.mark_unpacked(tgz_path);
-        Ok(())
+        Ok(out_dir)
     }
 
     /// Clear both the tar index and the fuse-link cache.
@@ -419,10 +402,9 @@ impl FuseFs {
 
     /// Extract a single file from a tgz.
     ///
-    /// Lookup order (minimises IO):
+    /// Lookup order:
     /// 1. In-memory tar index — O(1), zero IO (hot path)
-    /// 2. Disk cache — only on cold start when tar index is empty
-    /// 3. Decompress tgz → populate tar index + write to disk cache
+    /// 2. Decompress tgz → populate tar index → retry
     async fn extract_file(&self, tgz_path: &Path, file_path: &Path) -> Result<Bytes> {
         let lossy = file_path.to_string_lossy();
         let normalized = tar_index::strip_first(&lossy);
@@ -439,15 +421,7 @@ impl FuseFs {
             return Ok(content);
         }
 
-        // 2. Try disk cache — only if we know this tgz has unpacked files
-        let disk_path = Self::unpacked_path(tgz_path, normalized);
-        if self.is_known_unpacked(tgz_path)
-            && let Ok(data) = tokio_fs_ext::read(&disk_path).await
-        {
-            return Ok(Bytes::from(data));
-        }
-
-        // 3. Cache miss — load tgz, then retry
+        // 2. Cache miss — load tgz, then retry
         self.ensure_tgz_cached(tgz_path).await?;
 
         let (content, is_dir) = {
@@ -462,9 +436,6 @@ impl FuseFs {
         };
 
         if let Some(content) = content {
-            // Write-through to disk only after tgz decompress (already expensive)
-            Self::write_disk_cache(&disk_path, &content).await;
-            self.mark_unpacked(tgz_path);
             return Ok(content);
         }
 
@@ -483,22 +454,6 @@ impl FuseFs {
                 tgz_path.display()
             ),
         ))
-    }
-
-    /// Derive the unpacked disk cache path from tgz path + file name.
-    ///
-    /// `/stores/pkg.tgz` + `index.js` → `/stores/pkg/index.js`
-    fn unpacked_path(tgz_path: &Path, normalized: &str) -> PathBuf {
-        let stem = tgz_path.with_extension(""); // strip .tgz
-        stem.join(normalized)
-    }
-
-    /// Best-effort write to disk cache. Errors are silently ignored.
-    async fn write_disk_cache(path: &Path, content: &[u8]) {
-        if let Some(parent) = path.parent() {
-            let _ = tokio_fs_ext::create_dir_all(parent).await;
-        }
-        let _ = tokio_fs_ext::write(path, content).await;
     }
 
     /// List directory contents from a cached tgz.
@@ -723,36 +678,6 @@ mod tests {
             link.dir_in_tgz(Path::new("cjs")),
             Some(PathBuf::from("package/cjs"))
         );
-    }
-
-    #[wasm_bindgen_test]
-    fn test_unpacked_path() {
-        let tgz = Path::new("/stores/registry.npmjs.org/react/-/react-18.2.0.tgz");
-        let disk = FuseFs::unpacked_path(tgz, "index.js");
-        assert_eq!(
-            disk,
-            PathBuf::from("/stores/registry.npmjs.org/react/-/react-18.2.0/index.js")
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn test_unpacked_path_nested() {
-        let tgz = Path::new("/stores/pkg.tgz");
-        let disk = FuseFs::unpacked_path(tgz, "lib/utils/index.js");
-        assert_eq!(disk, PathBuf::from("/stores/pkg/lib/utils/index.js"));
-    }
-
-    #[wasm_bindgen_test]
-    fn test_disk_unpacked_tracking() {
-        let fs = FuseFs::new(100 * 1024 * 1024, 1000);
-        let tgz = Path::new("/stores/foo.tgz");
-
-        assert!(!fs.is_known_unpacked(tgz));
-        fs.mark_unpacked(tgz);
-        assert!(fs.is_known_unpacked(tgz));
-
-        // Different tgz still unknown
-        assert!(!fs.is_known_unpacked(Path::new("/stores/bar.tgz")));
     }
 
     #[wasm_bindgen_test]
