@@ -251,8 +251,7 @@ impl FuseFs {
 
     /// Eagerly extract all files from a tgz to the disk cache.
     ///
-    /// Called during install so that cold-start reads go straight to disk,
-    /// bypassing tgz decompression entirely.
+    /// Writes files concurrently to avoid hanging the install process.
     pub async fn eager_extract_tgz(&self, tgz_path: &Path) -> Result<()> {
         self.ensure_tgz_cached(tgz_path).await?;
 
@@ -268,15 +267,27 @@ impl FuseFs {
                 .collect()
         };
 
-        for (name, content) in &files {
-            let disk_path = Self::unpacked_path(tgz_path, name);
-            Self::write_disk_cache(&disk_path, content).await;
+        if files.is_empty() {
+            return Ok(());
         }
 
-        if !files.is_empty() {
-            self.mark_unpacked(tgz_path);
-        }
+        // Write files to disk concurrently
+        use futures::stream::{self, StreamExt};
+        let tgz_path_buf = tgz_path.to_path_buf();
 
+        stream::iter(files)
+            .map(|(name, content)| {
+                let t_path = tgz_path_buf.clone();
+                async move {
+                    let disk_path = Self::unpacked_path(&t_path, &name);
+                    Self::write_disk_cache(&disk_path, &content).await;
+                }
+            })
+            .buffer_unordered(32) // Concurrency limit for OPFS writes
+            .collect::<Vec<()>>()
+            .await;
+
+        self.mark_unpacked(tgz_path);
         Ok(())
     }
 
