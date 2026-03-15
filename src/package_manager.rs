@@ -118,13 +118,24 @@ pub(crate) async fn install(
         }
     }
 
-    // 3. Create fuse links for cached packages
+    // 3. Create fuse links for cached packages + warm caches
+    let lazy_tgz = project.config().lazy_tgz;
     for (tgz_path, targets) in &cached {
+        let (link_target, prefix) = if lazy_tgz {
+            (tgz_path.clone(), Some("package"))
+        } else {
+            let out = fuse
+                .extract_tgz_to_dir(tgz_path)
+                .await
+                .map_err(|e| OpfsError::Other(format!("extract tgz: {e}")))?;
+            (out, None)
+        };
         for target in targets {
             let dst = std::path::PathBuf::from(target);
-            fuse.create_fuse_link(tgz_path, &dst, Some("package"))
+            fuse.create_fuse_link(&link_target, &dst, prefix)
                 .await
                 .map_err(|e| OpfsError::Other(format!("fuse link for {target}: {e}")))?;
+            fuse.warm_link_cache(&dst, &link_target, prefix);
         }
     }
 
@@ -156,11 +167,21 @@ pub(crate) async fn install(
         for result in results {
             let (name, url, targets) = result?;
             let tgz_path = store.tgz_path(&name, &url);
+            let (link_target, prefix) = if lazy_tgz {
+                (tgz_path.clone(), Some("package"))
+            } else {
+                let out = fuse
+                    .extract_tgz_to_dir(&tgz_path)
+                    .await
+                    .map_err(|e| OpfsError::Other(format!("extract tgz: {e}")))?;
+                (out, None)
+            };
             for target in &targets {
                 let dst = std::path::PathBuf::from(target);
-                fuse.create_fuse_link(&tgz_path, &dst, Some("package"))
+                fuse.create_fuse_link(&link_target, &dst, prefix)
                     .await
                     .map_err(|e| OpfsError::Other(format!("fuse link for {target}: {e}")))?;
+                fuse.warm_link_cache(&dst, &link_target, prefix);
             }
         }
     }

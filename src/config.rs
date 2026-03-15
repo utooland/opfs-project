@@ -15,6 +15,11 @@ pub struct Config {
     pub download_retries: u32,
     /// Base delay in ms for exponential back-off between retries (default: 500)
     pub retry_base_delay_ms: u64,
+    /// When `true` (default), files are read from tgz via the in-memory tar
+    /// index — no files are extracted to disk. When `false`, tgz contents are
+    /// extracted to real files during install, so subsequent reads are plain
+    /// filesystem reads.
+    pub lazy_tgz: bool,
 }
 
 impl Default for Config {
@@ -26,6 +31,7 @@ impl Default for Config {
             max_concurrent_downloads: 20,
             download_retries: 3,
             retry_base_delay_ms: 500,
+            lazy_tgz: true,
         }
     }
 }

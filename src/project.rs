@@ -59,13 +59,15 @@ impl OpfsProject {
     // ── path preparation ─────────────────────────────────────────────
 
     fn prepare_path(&self, path: &Path) -> PathBuf {
-        let cwd = self.cwd();
         if path.starts_with("/") {
             path.to_path_buf()
-        } else if let Ok(stripped) = path.strip_prefix(".") {
-            cwd.join(stripped)
         } else {
-            cwd.join(path)
+            let cwd = self.cwd();
+            if let Ok(stripped) = path.strip_prefix(".") {
+                cwd.join(stripped)
+            } else {
+                cwd.join(path)
+            }
         }
     }
 
