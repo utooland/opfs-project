@@ -128,8 +128,6 @@ pub(crate) async fn install(
             // Pre-populate link cache (avoids disk IO on cold read)
             fuse.warm_link_cache(&dst, tgz_path, Some("package"));
         }
-        // Eagerly extract all files to disk cache
-        let _ = fuse.eager_extract_tgz(tgz_path).await;
     }
 
     // 4. Download and link the rest
@@ -167,7 +165,6 @@ pub(crate) async fn install(
                     .map_err(|e| OpfsError::Other(format!("fuse link for {target}: {e}")))?;
                 fuse.warm_link_cache(&dst, &tgz_path, Some("package"));
             }
-            let _ = fuse.eager_extract_tgz(&tgz_path).await;
         }
     }
 
