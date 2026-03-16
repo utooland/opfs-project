@@ -119,9 +119,8 @@ pub(crate) async fn install(
     }
 
     // 3. Create fuse links for cached packages + warm caches
-    let lazy_tgz = project.config().lazy_tgz;
     for (tgz_path, targets) in &cached {
-        link_and_warm_cache(fuse, lazy_tgz, tgz_path, targets).await?;
+        link_and_warm_cache(fuse, tgz_path, targets).await?;
     }
 
     // 4. Download and link the rest
@@ -152,7 +151,7 @@ pub(crate) async fn install(
         for result in results {
             let (name, url, targets) = result?;
             let tgz_path = store.tgz_path(&name, &url);
-            link_and_warm_cache(fuse, lazy_tgz, &tgz_path, &targets).await?;
+            link_and_warm_cache(fuse, &tgz_path, &targets).await?;
         }
     }
 
@@ -162,25 +161,19 @@ pub(crate) async fn install(
 /// Create fuse links and warm the cache for a set of target paths.
 async fn link_and_warm_cache(
     fuse: &crate::fuse_fs::FuseFs,
-    lazy_tgz: bool,
     tgz_path: &std::path::Path,
     targets: &[String],
 ) -> std::result::Result<(), OpfsError> {
-    let (link_target, prefix) = if lazy_tgz {
-        (tgz_path.to_path_buf(), Some("package"))
-    } else {
-        let out = fuse
-            .extract_tgz_to_dir(tgz_path)
-            .await
-            .map_err(|e| OpfsError::Other(format!("extract tgz: {e}")))?;
-        (out, None)
-    };
+    let extracted_dir = fuse
+        .extract_tgz_to_dir(tgz_path)
+        .await
+        .map_err(|e| OpfsError::Other(format!("extract tgz: {e}")))?;
     for target in targets {
         let dst = std::path::PathBuf::from(target);
-        fuse.create_fuse_link(&link_target, &dst, prefix)
+        fuse.create_fuse_link(&extracted_dir, &dst)
             .await
             .map_err(|e| OpfsError::Other(format!("fuse link for {target}: {e}")))?;
-        fuse.warm_link_cache(&dst, &link_target, prefix);
+        fuse.warm_link_cache(&dst, &extracted_dir);
     }
     Ok(())
 }

@@ -1,34 +1,33 @@
 //! Fuse-link filesystem layer.
 //!
 //! A "fuse link" is a small file (`fuse.link`) placed inside a
-//! `node_modules/<pkg>/` directory. Its content points to a tgz in the
-//! store plus an optional prefix, enabling lazy on-demand extraction.
+//! `node_modules/<pkg>/` directory. Its content points to an extracted
+//! directory in the store, enabling transparent reads.
 
-use std::collections::{HashMap, HashSet};
-use std::io::{Error, ErrorKind, Result};
+use std::collections::HashMap;
+use std::io::{Error, ErrorKind, Read, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
+use flate2::read::GzDecoder;
+use tar::Archive;
 use tokio_fs_ext::DirEntry;
 use tracing::warn;
-
-use crate::tar_index::{self, TarIndex};
 
 // ── FuseLink (typed representation) ──────────────────────────────────────
 
 /// Parsed representation of a `fuse.link` file.
 ///
-/// Format on disk: `<tgz_path>` or `<tgz_path>|<prefix>`
+/// Format on disk: a single line containing the absolute OPFS path to
+/// the extracted package directory.
 ///
-/// Wrapped in `Arc` when cached to avoid cloning `PathBuf` + `String`
-/// on every cache hit.
+/// Wrapped in `Arc` when cached to avoid cloning `PathBuf` on every
+/// cache hit.
 #[derive(Debug, Clone)]
 pub struct FuseLink {
-    /// Absolute OPFS path to the tgz in the store.
-    pub tgz_path: PathBuf,
-    /// Optional prefix directory inside the tgz (e.g. `"package"`).
-    pub prefix: Option<String>,
+    /// Absolute OPFS path to the extracted package directory.
+    pub target_dir: PathBuf,
 }
 
 impl FuseLink {
@@ -38,55 +37,16 @@ impl FuseLink {
         if line.is_empty() {
             return None;
         }
-        if let Some((tgz, prefix)) = line.split_once('|') {
-            Some(Self {
-                tgz_path: PathBuf::from(tgz),
-                prefix: Some(prefix.to_string()),
-            })
-        } else {
-            Some(Self {
-                tgz_path: PathBuf::from(line),
-                prefix: None,
-            })
-        }
+        // Strip legacy `|prefix` suffix if present (backwards compat)
+        let path = line.split_once('|').map_or(line, |(p, _)| p);
+        Some(Self {
+            target_dir: PathBuf::from(path),
+        })
     }
 
     /// Serialise back to the on-disk format.
     pub fn to_content(&self) -> String {
-        match &self.prefix {
-            Some(p) => format!("{}|{p}\n", self.tgz_path.display()),
-            None => format!("{}\n", self.tgz_path.display()),
-        }
-    }
-
-    /// Resolve a relative path to a file path *inside* the tgz.
-    ///
-    /// Returns `None` if relative is empty (root = directory) or no prefix.
-    pub fn file_in_tgz(&self, relative: &Path) -> Option<PathBuf> {
-        let prefix = self.prefix.as_ref()?;
-        if relative.as_os_str().is_empty() {
-            None
-        } else {
-            Some(Path::new(prefix).join(relative))
-        }
-    }
-
-    /// Resolve a relative path to a directory path *inside* the tgz.
-    ///
-    /// For root (`relative == ""`), returns empty `PathBuf`.
-    /// Returns `None` when no prefix.
-    pub fn dir_in_tgz(&self, relative: &Path) -> Option<PathBuf> {
-        let prefix = self.prefix.as_ref()?;
-        if relative.as_os_str().is_empty() {
-            Some(PathBuf::new())
-        } else {
-            Some(Path::new(prefix).join(relative))
-        }
-    }
-
-    /// Whether this link points into a tgz (has a prefix).
-    pub fn is_tgz_mode(&self) -> bool {
-        self.prefix.is_some()
+        format!("{}\n", self.target_dir.display())
     }
 }
 
@@ -96,43 +56,32 @@ const EXTRACTION_CONCURRENCY: usize = 32;
 // ── FuseFs ───────────────────────────────────────────────────────────────
 
 /// Fuse-link aware filesystem overlay.
-///
-/// Owns both the fuse-link path cache and the tar index.
 pub struct FuseFs {
     /// Cache: fuse.link file path → parsed FuseLink (Arc to avoid cloning)
     link_cache: RwLock<HashMap<PathBuf, Arc<FuseLink>>>,
-    tar_index: RwLock<TarIndex>,
-    /// Tgz paths currently being loaded (prevents duplicate decompress).
-    loading: RwLock<HashSet<PathBuf>>,
     max_link_cache: usize,
 }
 
 impl FuseFs {
-    pub fn new(tar_cache_max_bytes: usize, fuse_cache_max_entries: usize) -> Self {
+    pub fn new(fuse_cache_max_entries: usize) -> Self {
         Self {
             link_cache: RwLock::new(HashMap::new()),
-            tar_index: RwLock::new(TarIndex::new(tar_cache_max_bytes)),
-            loading: RwLock::new(HashSet::new()),
             max_link_cache: fuse_cache_max_entries,
         }
     }
 
-    /// Create a fuse link file on disk and cache the mapping.
-    pub async fn create_fuse_link(
-        &self,
-        tgz_path: &Path,
-        dst: &Path,
-        prefix: Option<&str>,
-    ) -> Result<()> {
-        tokio_fs_ext::create_dir_all(dst).await?;
+    /// Create a fuse link: write `fuse.link` under `dst` pointing to `target_dir`.
+    pub async fn create_fuse_link(&self, target_dir: &Path, dst: &Path) -> Result<()> {
+        let fuse_link_path = dst.join("fuse.link");
 
-        let fuse_link_path = locate_fuse_link_file(dst).ok_or_else(|| {
+        // Ensure the destination directory exists
+        let parent = fuse_link_path.parent().ok_or_else(|| {
             Error::new(ErrorKind::InvalidInput, "cannot determine fuse.link path")
         })?;
+        tokio_fs_ext::create_dir_all(parent).await?;
 
         let link = Arc::new(FuseLink {
-            tgz_path: tgz_path.to_path_buf(),
-            prefix: prefix.map(String::from),
+            target_dir: target_dir.to_path_buf(),
         });
 
         tokio_fs_ext::write(&fuse_link_path, link.to_content().as_bytes()).await?;
@@ -160,29 +109,12 @@ impl FuseFs {
             None => return Ok(None),
         };
 
-        if !resolved.link.is_tgz_mode() {
-            // Non-lazy: link points to an extracted directory, join relative path
-            let real_path = resolved.link.tgz_path.join(&resolved.relative);
-            return match tokio_fs_ext::read(&real_path).await {
-                Ok(v) => Ok(Some(Bytes::from(v))),
-                Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(e),
-            };
+        let real_path = resolved.link.target_dir.join(&resolved.relative);
+        match tokio_fs_ext::read(&real_path).await {
+            Ok(v) => Ok(Some(Bytes::from(v))),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
         }
-
-        let file_path = match resolved.link.file_in_tgz(&resolved.relative) {
-            Some(p) => p,
-            None => {
-                return Err(Error::new(
-                    ErrorKind::IsADirectory,
-                    "cannot read directory as file",
-                ));
-            }
-        };
-
-        self.extract_file(&resolved.link.tgz_path, &file_path)
-            .await
-            .map(Some)
     }
 
     /// Try to read a directory through fuse-link indirection.
@@ -194,18 +126,10 @@ impl FuseFs {
             None => return Ok(None),
         };
 
-        let target_entries = if let Some(dir_path) = resolved.link.dir_in_tgz(&resolved.relative) {
-            self.list_dir_in_tgz(&resolved.link.tgz_path, &dir_path)
-                .await
-                .ok()
-        } else {
-            // Non-lazy: link points to an extracted directory, join relative path
-            let real_dir = resolved.link.tgz_path.join(&resolved.relative);
-            read_dir_direct(&real_dir).await.ok()
-        };
-
-        let Some(target_entries) = target_entries else {
-            return Ok(None);
+        let real_dir = resolved.link.target_dir.join(&resolved.relative);
+        let target_entries = match read_dir_direct(&real_dir).await {
+            Ok(entries) => entries,
+            Err(_) => return Ok(None),
         };
 
         // Merge with any real files in the directory (excluding fuse.link itself)
@@ -222,16 +146,32 @@ impl FuseFs {
         }
     }
 
+    /// Try to get metadata through fuse-link indirection.
+    ///
+    /// Returns `Ok(None)` if the path has no fuse link.
+    pub async fn try_metadata(&self, path: &Path) -> Result<Option<tokio_fs_ext::Metadata>> {
+        let resolved = match self.resolve(path).await? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let real_path = resolved.link.target_dir.join(&resolved.relative);
+        match tokio_fs_ext::metadata(&real_path).await {
+            Ok(m) => Ok(Some(m)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Pre-populate the link cache for a known fuse link (avoids disk IO on cold read).
     ///
     /// Called during install after `create_fuse_link` to ensure the cache is warm.
-    pub fn warm_link_cache(&self, dst: &Path, tgz_path: &Path, prefix: Option<&str>) {
+    pub fn warm_link_cache(&self, dst: &Path, target_dir: &Path) {
         let Some(fuse_link_path) = locate_fuse_link_file(dst) else {
             return;
         };
         let link = Arc::new(FuseLink {
-            tgz_path: tgz_path.to_path_buf(),
-            prefix: prefix.map(String::from),
+            target_dir: target_dir.to_path_buf(),
         });
         if let Ok(mut cache) = self.link_cache.write() {
             cache.insert(fuse_link_path, link);
@@ -240,30 +180,27 @@ impl FuseFs {
 
     /// Extract all files from a tgz into a real directory on disk.
     ///
-    /// Used by non-lazy mode: after extraction, fuse links point to the
-    /// extracted directory, so reads are plain filesystem reads.
-    ///
+    /// Uses streaming decompression — no full decompressed buffer in memory.
     /// Returns the extraction root directory (tgz path with `.tgz` stripped).
     pub async fn extract_tgz_to_dir(&self, tgz_path: &Path) -> Result<PathBuf> {
-        self.ensure_tgz_cached(tgz_path).await?;
-
         let out_dir = tgz_path.with_extension(""); // strip .tgz
 
-        let files: Vec<(String, Bytes)> = {
-            let idx = self.tar_index.read().map_err(|e| {
-                warn!("tar index read lock poisoned: {e}");
-                Error::other("tar index lock poisoned")
-            })?;
-            idx.all_files(tgz_path)
-                .unwrap_or_default()
-                .into_iter()
-                .collect()
-        };
+        // Skip if already extracted
+        if tokio_fs_ext::metadata(&out_dir).await.is_ok() {
+            return Ok(out_dir);
+        }
+
+        // Read compressed tgz
+        let raw = tokio_fs_ext::read(tgz_path).await?;
+
+        // Stream through tar entries via GzDecoder (decompresses on-the-fly)
+        let entries = extract_entries_from_tgz(&raw)?;
+        drop(raw); // Free compressed data immediately
 
         use futures::stream::{self, StreamExt};
         let out = out_dir.clone();
 
-        stream::iter(files)
+        stream::iter(entries)
             .map(|(name, content)| {
                 let dir = out.clone();
                 async move {
@@ -281,11 +218,8 @@ impl FuseFs {
         Ok(out_dir)
     }
 
-    /// Clear both the tar index and the fuse-link cache.
+    /// Clear the fuse-link cache.
     pub fn clear(&self) {
-        if let Ok(mut idx) = self.tar_index.write() {
-            idx.clear();
-        }
         if let Ok(mut lc) = self.link_cache.write() {
             lc.clear();
         }
@@ -354,131 +288,35 @@ impl FuseFs {
         Ok(Some(link))
     }
 
-    /// Ensure a tgz is loaded into the tar index.
-    ///
-    /// Uses an in-flight set to prevent the same tgz from being read and
-    /// decompressed concurrently by multiple callers.
-    async fn ensure_tgz_cached(&self, tgz_path: &Path) -> Result<()> {
-        // Fast path — already cached
-        {
-            let idx = self.tar_index.read().map_err(|e| {
-                warn!("tar index read lock poisoned: {e}");
-                Error::other("tar index lock poisoned")
-            })?;
-            if idx.has_tgz(tgz_path) {
-                return Ok(());
-            }
-        }
+}
 
-        // Dedup: skip if another task is already loading this tgz
-        {
-            let loading = self.loading.read().map_err(|_| Error::other("lock"))?;
-            if loading.contains(tgz_path) {
-                // Another task is loading — return Ok and let caller retry
-                // via extract_file's cache-miss → ensure_tgz_cached loop.
-                return Ok(());
-            }
-        }
-        // Mark as loading
-        if let Ok(mut loading) = self.loading.write() {
-            loading.insert(tgz_path.to_path_buf());
-        }
+/// Parse tgz bytes by streaming through tar entries.
+/// GzDecoder decompresses on-the-fly — no full decompressed buffer.
+fn extract_entries_from_tgz(tgz_bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    let gz = GzDecoder::new(tgz_bytes);
+    let mut archive = Archive::new(gz);
+    let mut entries = Vec::new();
 
-        // Parse outside all locks
-        let result = async {
-            let raw = tokio_fs_ext::read(tgz_path).await?;
-            tar_index::parse_tgz(&raw)
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result?;
+        if !entry.header().entry_type().is_file() {
+            continue;
         }
-        .await;
-
-        // Unmark loading regardless of success/failure
-        if let Ok(mut loading) = self.loading.write() {
-            loading.remove(tgz_path);
+        let path = entry.path()?.to_string_lossy().to_string();
+        // Strip the first component (e.g. "package/") from tar paths
+        let normalized = path
+            .find('/')
+            .map(|idx| &path[idx + 1..])
+            .unwrap_or(&path);
+        if normalized.is_empty() {
+            continue;
         }
-
-        let parsed = result?;
-
-        // Insert — write lock (insert_tgz already skips if present)
-        let mut idx = self.tar_index.write().map_err(|e| {
-            warn!("tar index write lock poisoned: {e}");
-            Error::other("tar index lock poisoned")
-        })?;
-        idx.insert_tgz(tgz_path.to_path_buf(), parsed);
-        Ok(())
+        let mut content = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut content)?;
+        entries.push((normalized.to_string(), content));
     }
 
-    /// Extract a single file from a tgz.
-    ///
-    /// Lookup order:
-    /// 1. In-memory tar index — O(1), zero IO (hot path)
-    /// 2. Decompress tgz → populate tar index → retry
-    async fn extract_file(&self, tgz_path: &Path, file_path: &Path) -> Result<Bytes> {
-        let lossy = file_path.to_string_lossy();
-        let normalized = tar_index::strip_first(&lossy);
-
-        // 1. Try in-memory tar index (fastest, no IO)
-        let from_index = {
-            let idx = self.tar_index.read().map_err(|e| {
-                warn!("tar index read lock poisoned: {e}");
-                Error::other("tar index lock poisoned")
-            })?;
-            idx.get_file(tgz_path, normalized)
-        };
-        if let Some(content) = from_index {
-            return Ok(content);
-        }
-
-        // 2. Cache miss — load tgz, then retry
-        self.ensure_tgz_cached(tgz_path).await?;
-
-        let (content, is_dir) = {
-            let idx = self.tar_index.read().map_err(|e| {
-                warn!("tar index read lock poisoned: {e}");
-                Error::other("tar index lock poisoned")
-            })?;
-            (
-                idx.get_file(tgz_path, normalized),
-                idx.is_dir_in_tgz(tgz_path, normalized),
-            )
-        };
-
-        if let Some(content) = content {
-            return Ok(content);
-        }
-
-        if is_dir {
-            return Err(Error::new(
-                ErrorKind::IsADirectory,
-                format!("{} is a directory", file_path.display()),
-            ));
-        }
-
-        Err(Error::new(
-            ErrorKind::NotFound,
-            format!(
-                "file {} not found in {}",
-                file_path.display(),
-                tgz_path.display()
-            ),
-        ))
-    }
-
-    /// List directory contents from a cached tgz.
-    async fn list_dir_in_tgz(&self, tgz_path: &Path, dir_path: &Path) -> Result<Vec<DirEntry>> {
-        let lossy = dir_path.to_string_lossy();
-        let normalized = tar_index::strip_first(&lossy);
-        self.ensure_tgz_cached(tgz_path).await?;
-
-        let idx = self.tar_index.read().map_err(|e| {
-            warn!("tar index read lock poisoned: {e}");
-            Error::other("tar index lock poisoned")
-        })?;
-
-        match idx.list_dir(tgz_path, normalized) {
-            Some(items) => Ok(tar_index::to_dir_entries(items, dir_path)),
-            None => Ok(vec![]),
-        }
-    }
+    Ok(entries)
 }
 
 // ── Resolved ─────────────────────────────────────────────────────────────
@@ -565,25 +403,22 @@ mod tests {
     use wasm_bindgen_test::*;
 
     #[wasm_bindgen_test]
-    fn test_fuse_link_parse_with_prefix() {
-        let link = FuseLink::parse("/stores/lodash/-/lodash-4.17.21.tgz|package").unwrap();
+    fn test_fuse_link_parse_target_dir() {
+        let link = FuseLink::parse("/stores/lodash/-/lodash-4.17.21").unwrap();
         assert_eq!(
-            link.tgz_path,
-            PathBuf::from("/stores/lodash/-/lodash-4.17.21.tgz")
+            link.target_dir,
+            PathBuf::from("/stores/lodash/-/lodash-4.17.21")
         );
-        assert_eq!(link.prefix.as_deref(), Some("package"));
-        assert!(link.is_tgz_mode());
     }
 
     #[wasm_bindgen_test]
-    fn test_fuse_link_parse_without_prefix() {
-        let link = FuseLink::parse("/stores/lodash/-/lodash-4.17.21.tgz\n").unwrap();
+    fn test_fuse_link_parse_strips_legacy_prefix() {
+        // Legacy format: path|prefix — should strip the |prefix part
+        let link = FuseLink::parse("/stores/lodash/-/lodash-4.17.21.tgz|package").unwrap();
         assert_eq!(
-            link.tgz_path,
+            link.target_dir,
             PathBuf::from("/stores/lodash/-/lodash-4.17.21.tgz")
         );
-        assert!(link.prefix.is_none());
-        assert!(!link.is_tgz_mode());
     }
 
     #[wasm_bindgen_test]
@@ -595,39 +430,11 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_fuse_link_roundtrip() {
         let link = FuseLink {
-            tgz_path: PathBuf::from("/stores/foo/-/foo-1.0.0.tgz"),
-            prefix: Some("package".to_string()),
+            target_dir: PathBuf::from("/stores/foo/-/foo-1.0.0"),
         };
         let content = link.to_content();
         let parsed = FuseLink::parse(&content).unwrap();
-        assert_eq!(parsed.tgz_path, link.tgz_path);
-        assert_eq!(parsed.prefix, link.prefix);
-    }
-
-    #[wasm_bindgen_test]
-    fn test_fuse_link_file_in_tgz() {
-        let link = FuseLink {
-            tgz_path: PathBuf::from("/stores/foo.tgz"),
-            prefix: Some("package".into()),
-        };
-        assert_eq!(
-            link.file_in_tgz(Path::new("index.js")),
-            Some(PathBuf::from("package/index.js"))
-        );
-        assert_eq!(link.file_in_tgz(Path::new("")), None);
-    }
-
-    #[wasm_bindgen_test]
-    fn test_fuse_link_dir_in_tgz() {
-        let link = FuseLink {
-            tgz_path: PathBuf::from("/stores/foo.tgz"),
-            prefix: Some("package".into()),
-        };
-        assert_eq!(link.dir_in_tgz(Path::new("")), Some(PathBuf::new()));
-        assert_eq!(
-            link.dir_in_tgz(Path::new("lib")),
-            Some(PathBuf::from("package/lib"))
-        );
+        assert_eq!(parsed.target_dir, link.target_dir);
     }
 
     #[wasm_bindgen_test]
@@ -648,7 +455,6 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_locate_fuse_link_nested_node_modules() {
-        // Hoisted deps: node_modules/a/node_modules/b/lib/index.js
         assert_eq!(
             locate_fuse_link_file(Path::new("./node_modules/a/node_modules/b/lib/index.js")),
             Some(PathBuf::from("./node_modules/a/node_modules/b/fuse.link"))
@@ -662,35 +468,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_fuse_link_no_prefix_returns_none() {
-        let link = FuseLink {
-            tgz_path: PathBuf::from("/stores/foo.tgz"),
-            prefix: None,
-        };
-        assert_eq!(link.file_in_tgz(Path::new("index.js")), None);
-        assert_eq!(link.dir_in_tgz(Path::new("")), None);
-        assert!(!link.is_tgz_mode());
-    }
-
-    #[wasm_bindgen_test]
-    fn test_fuse_link_deep_relative_path() {
-        let link = FuseLink {
-            tgz_path: PathBuf::from("/stores/react.tgz"),
-            prefix: Some("package".into()),
-        };
-        assert_eq!(
-            link.file_in_tgz(Path::new("cjs/react.production.min.js")),
-            Some(PathBuf::from("package/cjs/react.production.min.js"))
-        );
-        assert_eq!(
-            link.dir_in_tgz(Path::new("cjs")),
-            Some(PathBuf::from("package/cjs"))
-        );
-    }
-
-    #[wasm_bindgen_test]
     fn test_locate_fuse_link_fast_path_skips_non_node_modules() {
-        // Paths without node_modules should return None immediately
         assert_eq!(locate_fuse_link_file(Path::new("/src/App.tsx")), None);
         assert_eq!(
             locate_fuse_link_file(Path::new("/project/lib/utils.js")),
