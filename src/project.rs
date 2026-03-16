@@ -32,7 +32,7 @@ impl Default for OpfsProject {
 impl OpfsProject {
     /// Create a new project with the given config.
     pub fn new(config: Config) -> Self {
-        let fuse_fs = FuseFs::new(config.tar_cache_max_bytes, config.fuse_cache_max_entries);
+        let fuse_fs = FuseFs::new(config.fuse_cache_max_entries);
         let store = Store::new(&config);
         Self {
             config,
@@ -94,6 +94,17 @@ impl OpfsProject {
         }
 
         tokio_fs_ext::read_dir(&prepared).await?.collect()
+    }
+
+    /// Get file/directory metadata, transparently resolving fuse links.
+    pub async fn metadata(&self, path: impl AsRef<Path>) -> Result<tokio_fs_ext::Metadata> {
+        let prepared = self.prepare_path(path.as_ref());
+
+        if let Some(meta) = self.fuse_fs.try_metadata(&prepared).await? {
+            return Ok(meta);
+        }
+
+        tokio_fs_ext::metadata(&prepared).await
     }
 
     // ── package management ───────────────────────────────────────────

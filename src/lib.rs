@@ -22,7 +22,6 @@ pub mod package_lock;
 pub mod package_manager;
 pub mod project;
 pub mod store;
-pub mod tar_index;
 
 // ── re-exports ───────────────────────────────────────────────────────────
 

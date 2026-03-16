@@ -22,7 +22,7 @@ futures = "0.3.31"
 futures-util = "0.3.31"
 reqwest = { version = "0.12.22" }
 serde_json = "1.0.140"
-tokio-fs-ext = "0.7.0"
+tokio-fs-ext = "0.7.8"
 tracing = "0.1.41"
 anyhow = { version = "1.0", features = ["backtrace"] }
 sha1 = "0.10"
@@ -37,7 +37,7 @@ console_error_panic_hook = "0.1"
 
 
 [dev-dependencies]
-wasm-bindgen-test = "0.3"
+wasm-bindgen-test = "=0.3.58"
 tracing-subscriber = "0.3.19"
 
 [lib]
