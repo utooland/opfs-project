@@ -345,7 +345,6 @@ impl FuseFs {
     }
 }
 
-
 // ── Resolved ─────────────────────────────────────────────────────────────
 
 /// A successfully resolved fuse-link lookup.
@@ -591,6 +590,7 @@ mod tests {
         // Check a few files
         assert!(tokio_fs_ext::metadata(&out.join("file_0.txt")).await.is_ok());
         assert!(tokio_fs_ext::metadata(&out.join("file_49.txt")).await.is_ok());
+        assert!(tokio_fs_ext::metadata(&out.join("file_99.txt")).await.is_ok());
         assert!(tokio_fs_ext::metadata(&out.join("nested/deep/file.js")).await.is_ok());
 
         let content = tokio_fs_ext::read_to_string(&out.join("nested/deep/file.js")).await.unwrap();
