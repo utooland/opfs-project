@@ -51,7 +51,7 @@ impl FuseLink {
 }
 
 /// Max concurrent OPFS writes during tgz extraction.
-const EXTRACTION_CONCURRENCY: usize = 32;
+const EXTRACTION_CONCURRENCY: usize = 64;
 
 // ── FuseFs ───────────────────────────────────────────────────────────────
 
@@ -195,31 +195,73 @@ impl FuseFs {
             return Ok(out_dir);
         }
 
-        let entries = {
-            let raw = tokio_fs_ext::read(tgz_path).await?;
-            extract_entries_from_tgz(&raw)?
-        };
+        let raw = tokio_fs_ext::read(tgz_path).await?;
+        let gz = GzDecoder::new(&raw[..]);
+        let mut archive = Archive::new(gz);
 
-        use futures::stream::{self, StreamExt};
-        let out = out_dir.clone();
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let mut write_futures = FuturesUnordered::new();
 
-        let results: Vec<Result<()>> = stream::iter(entries)
-            .map(|(name, content)| {
-                let dir = out.clone();
-                async move {
-                    let path = dir.join(&name);
-                    if let Some(parent) = path.parent() {
-                        tokio_fs_ext::create_dir_all(parent).await?;
-                    }
-                    tokio_fs_ext::write(&path, &content).await
+        for entry_result in archive.entries()? {
+            let mut entry = entry_result?;
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+
+            let path = entry.path()?.to_path_buf();
+
+            // Security: reject absolute paths and path traversal attempts
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("malicious path in tar entry: {}", path.display()),
+                ));
+            }
+
+            // Strip the first component (e.g. "package/") from tar paths
+            let normalized = if let Some(first) = path.components().next() {
+                let stripped = path.strip_prefix(first).unwrap_or(&path);
+                if stripped.as_os_str().is_empty() {
+                    path
+                } else {
+                    stripped.to_path_buf()
                 }
-            })
-            .buffer_unordered(EXTRACTION_CONCURRENCY)
-            .collect()
-            .await;
+            } else {
+                path
+            };
 
-        // Propagate any write errors — do NOT write sentinel if extraction is incomplete
-        results.into_iter().collect::<Result<Vec<()>>>()?;
+            if normalized.as_os_str().is_empty() {
+                continue;
+            }
+
+            let mut content = Vec::with_capacity(entry.size() as usize);
+            entry.read_to_end(&mut content)?;
+            let content = Bytes::from(content);
+
+            let full_path = out_dir.join(normalized);
+            write_futures.push(async move {
+                if let Some(parent) = full_path.parent() {
+                    tokio_fs_ext::create_dir_all(parent).await?;
+                }
+                tokio_fs_ext::write(&full_path, &content).await
+            });
+
+            // Keep concurrency in check
+            if write_futures.len() >= EXTRACTION_CONCURRENCY {
+                if let Some(res) = write_futures.next().await {
+                    res?;
+                }
+            }
+        }
+
+        // Wait for remaining writes
+        while let Some(res) = write_futures.next().await {
+            res?;
+        }
 
         // Mark extraction as complete
         tokio_fs_ext::write(&sentinel, b"").await?;
@@ -301,35 +343,6 @@ impl FuseFs {
             }
         }
     }
-}
-
-/// Parse tgz bytes by streaming through tar entries.
-/// GzDecoder decompresses on-the-fly — no full decompressed buffer.
-fn extract_entries_from_tgz(tgz_bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
-    let gz = GzDecoder::new(tgz_bytes);
-    let mut archive = Archive::new(gz);
-    let mut entries = Vec::new();
-
-    for entry_result in archive.entries()? {
-        let mut entry = entry_result?;
-        if !entry.header().entry_type().is_file() {
-            continue;
-        }
-        let path = entry.path()?.to_string_lossy().to_string();
-        // Strip the first component (e.g. "package/") from tar paths
-        let normalized = path
-            .find('/')
-            .map(|idx| &path[idx + 1..])
-            .unwrap_or(&path);
-        if normalized.is_empty() {
-            continue;
-        }
-        let mut content = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut content)?;
-        entries.push((normalized.to_string(), content));
-    }
-
-    Ok(entries)
 }
 
 // ── Resolved ─────────────────────────────────────────────────────────────
@@ -550,6 +563,38 @@ mod tests {
         assert_eq!(out, out2);
         // File is still missing — confirms extraction was skipped
         assert!(tokio_fs_ext::metadata(&out.join("index.js")).await.is_err());
+
+        // Cleanup
+        let _ = tokio_fs_ext::remove_dir_all(base).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_extract_tgz_complex() {
+        let base = Path::new("/test_extract_complex");
+        let tgz_path = base.join("complex-1.0.0.tgz");
+        
+        use crate::archive::{gzip, PackFile};
+        let mut files = Vec::new();
+        for i in 0..100 {
+            files.push(PackFile::new(format!("package/file_{}.txt", i), format!("content {}", i).into_bytes()));
+        }
+        files.push(PackFile::new("package/nested/deep/file.js", b"console.log('deep')".to_vec()));
+        
+        let tgz = gzip(&files).unwrap();
+        let _ = tokio_fs_ext::create_dir_all(base).await;
+        tokio_fs_ext::write(&tgz_path, &tgz).await.unwrap();
+
+        let fs = FuseFs::new(100);
+        let out = fs.extract_tgz_to_dir(&tgz_path).await.unwrap();
+
+        // Check a few files
+        assert!(tokio_fs_ext::metadata(&out.join("file_0.txt")).await.is_ok());
+        assert!(tokio_fs_ext::metadata(&out.join("file_49.txt")).await.is_ok());
+        assert!(tokio_fs_ext::metadata(&out.join("file_99.txt")).await.is_ok());
+        assert!(tokio_fs_ext::metadata(&out.join("nested/deep/file.js")).await.is_ok());
+
+        let content = tokio_fs_ext::read_to_string(&out.join("nested/deep/file.js")).await.unwrap();
+        assert_eq!(content, "console.log('deep')");
 
         // Cleanup
         let _ = tokio_fs_ext::remove_dir_all(base).await;
