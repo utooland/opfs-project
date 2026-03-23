@@ -48,12 +48,12 @@ impl OpfsProject {
     /// Delegates to `tokio_fs_ext::set_current_dir` so that all code paths
     /// (including those outside `OpfsProject`) see the same cwd.
     pub fn set_cwd(&self, path: impl AsRef<Path>) {
-        tokio_fs_ext::set_current_dir(path).unwrap();
+        tokio_fs_ext::set_current_dir(path).expect("failed to set current directory");
     }
 
     /// Get the current working directory.
     pub fn cwd(&self) -> PathBuf {
-        tokio_fs_ext::current_dir().unwrap()
+        tokio_fs_ext::current_dir().expect("failed to get current directory")
     }
 
     // ── path preparation ─────────────────────────────────────────────

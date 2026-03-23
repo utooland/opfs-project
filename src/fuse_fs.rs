@@ -87,7 +87,7 @@ impl FuseFs {
         tokio_fs_ext::write(&fuse_link_path, link.to_content().as_bytes()).await?;
 
         if let Ok(mut cache) = self.link_cache.write() {
-            if cache.len() >= self.max_link_cache {
+            if cache.len() >= self.max_link_cache && !cache.contains_key(&fuse_link_path) {
                 let to_remove: Vec<_> = cache.keys().take(cache.len() / 2).cloned().collect();
                 for k in to_remove {
                     cache.remove(&k);
@@ -132,12 +132,20 @@ impl FuseFs {
             Err(_) => return Ok(None),
         };
 
-        // Merge with any real files in the directory (excluding fuse.link itself)
+        // Merge with any real files in the directory, deduplicating by name.
+        // Target entries (from extracted package) take priority.
         match read_dir_direct(path).await {
             Ok(original) => {
+                let target_names: std::collections::HashSet<_> = target_entries
+                    .iter()
+                    .map(|e| e.file_name())
+                    .collect();
                 let mut combined: Vec<_> = original
                     .into_iter()
-                    .filter(|e| e.file_name().to_string_lossy() != "fuse.link")
+                    .filter(|e| {
+                        e.file_name().to_string_lossy() != "fuse.link"
+                            && !target_names.contains(&e.file_name())
+                    })
                     .collect();
                 combined.extend(target_entries);
                 Ok(Some(combined))
@@ -174,6 +182,12 @@ impl FuseFs {
             target_dir: target_dir.to_path_buf(),
         });
         if let Ok(mut cache) = self.link_cache.write() {
+            if cache.len() >= self.max_link_cache && !cache.contains_key(&fuse_link_path) {
+                let to_remove: Vec<_> = cache.keys().take(cache.len() / 2).cloned().collect();
+                for k in to_remove {
+                    cache.remove(&k);
+                }
+            }
             cache.insert(fuse_link_path, link);
         }
     }
@@ -184,36 +198,43 @@ impl FuseFs {
     /// Returns the extraction root directory (tgz path with `.tgz` stripped).
     pub async fn extract_tgz_to_dir(&self, tgz_path: &Path) -> Result<PathBuf> {
         let out_dir = tgz_path.with_extension(""); // strip .tgz
+        let sentinel = PathBuf::from(format!("{}._resolved", out_dir.display()));
 
-        // Skip if already extracted
-        if tokio_fs_ext::metadata(&out_dir).await.is_ok() {
+        // Skip if already extracted successfully
+        if tokio_fs_ext::metadata(&sentinel).await.is_ok() {
             return Ok(out_dir);
         }
 
-        // Read compressed tgz
-        let raw = tokio_fs_ext::read(tgz_path).await?;
-
-        // Stream through tar entries via GzDecoder (decompresses on-the-fly)
-        let entries = extract_entries_from_tgz(&raw)?;
-        drop(raw); // Free compressed data immediately
+        let entries = {
+            let raw = tokio_fs_ext::read(tgz_path).await?;
+            extract_entries_from_tgz(&raw)?
+        };
 
         use futures::stream::{self, StreamExt};
         let out = out_dir.clone();
 
-        stream::iter(entries)
+        let results: Vec<Result<()>> = stream::iter(entries)
             .map(|(name, content)| {
                 let dir = out.clone();
                 async move {
                     let path = dir.join(&name);
                     if let Some(parent) = path.parent() {
-                        let _ = tokio_fs_ext::create_dir_all(parent).await;
+                        tokio_fs_ext::create_dir_all(parent).await?;
                     }
-                    let _ = tokio_fs_ext::write(&path, &content).await;
+                    tokio_fs_ext::write(&path, &content).await
                 }
             })
             .buffer_unordered(EXTRACTION_CONCURRENCY)
-            .collect::<Vec<()>>()
+            .collect()
             .await;
+
+        // Propagate any write errors — do NOT write sentinel if extraction is incomplete
+        for result in results {
+            result?;
+        }
+
+        // Mark extraction as complete
+        tokio_fs_ext::write(&sentinel, b"").await?;
 
         Ok(out_dir)
     }
@@ -372,8 +393,8 @@ fn locate_fuse_link_file(path: &Path) -> Option<PathBuf> {
                             base.push("fuse.link");
                             return Some(base);
                         }
-                    } else {
-                        // Unscoped: 1 component
+                    } else if pkg_str != "fuse.link" {
+                        // Unscoped: 1 component (skip fuse.link itself)
                         let mut base = comps.as_path().to_path_buf();
                         base.push("node_modules");
                         base.push(pkg);
@@ -475,5 +496,97 @@ mod tests {
             None
         );
         assert_eq!(locate_fuse_link_file(Path::new("package.json")), None);
+    }
+
+    // ── extract_tgz_to_dir tests ────────────────────────────────────
+
+    /// Helper: create a test tgz at the given path.
+    async fn write_test_tgz(tgz_path: &Path) {
+        use crate::archive::{gzip, PackFile};
+        let files = vec![
+            PackFile::new("package/package.json", br#"{"name":"test"}"#.to_vec()),
+            PackFile::new("package/index.js", b"module.exports = {}".to_vec()),
+        ];
+        let tgz = gzip(&files).unwrap();
+        if let Some(parent) = tgz_path.parent() {
+            let _ = tokio_fs_ext::create_dir_all(parent).await;
+        }
+        tokio_fs_ext::write(tgz_path, &tgz).await.unwrap();
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_extract_tgz_creates_sentinel() {
+        let base = Path::new("/test_extract_sentinel");
+        let tgz_path = base.join("pkg-1.0.0.tgz");
+        write_test_tgz(&tgz_path).await;
+
+        let fs = FuseFs::new(100);
+        let out = fs.extract_tgz_to_dir(&tgz_path).await.unwrap();
+
+        // Extraction dir is tgz path with .tgz stripped
+        assert_eq!(out, base.join("pkg-1.0.0"));
+
+        // Sentinel exists
+        let sentinel = PathBuf::from(format!("{}._resolved", out.display()));
+        assert!(tokio_fs_ext::metadata(&sentinel).await.is_ok());
+
+        // Extracted files exist
+        assert!(tokio_fs_ext::metadata(&out.join("package.json")).await.is_ok());
+        assert!(tokio_fs_ext::metadata(&out.join("index.js")).await.is_ok());
+
+        // Cleanup
+        let _ = tokio_fs_ext::remove_dir_all(base).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_extract_tgz_skips_when_sentinel_exists() {
+        let base = Path::new("/test_extract_skip");
+        let tgz_path = base.join("pkg-1.0.0.tgz");
+        write_test_tgz(&tgz_path).await;
+
+        let fs = FuseFs::new(100);
+
+        // First extraction
+        let out = fs.extract_tgz_to_dir(&tgz_path).await.unwrap();
+        assert!(tokio_fs_ext::metadata(&out.join("index.js")).await.is_ok());
+
+        // Delete a file to verify second call skips (doesn't re-extract)
+        let _ = tokio_fs_ext::remove_file(&out.join("index.js")).await;
+
+        // Second extraction — sentinel exists, should skip
+        let out2 = fs.extract_tgz_to_dir(&tgz_path).await.unwrap();
+        assert_eq!(out, out2);
+        // File is still missing — confirms extraction was skipped
+        assert!(tokio_fs_ext::metadata(&out.join("index.js")).await.is_err());
+
+        // Cleanup
+        let _ = tokio_fs_ext::remove_dir_all(base).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_extract_tgz_re_extracts_without_sentinel() {
+        let base = Path::new("/test_extract_reextract");
+        let tgz_path = base.join("pkg-1.0.0.tgz");
+        write_test_tgz(&tgz_path).await;
+
+        let fs = FuseFs::new(100);
+        let out_dir = base.join("pkg-1.0.0");
+        let sentinel = PathBuf::from(format!("{}._resolved", out_dir.display()));
+
+        // Simulate incomplete extraction: create dir without sentinel
+        tokio_fs_ext::create_dir_all(&out_dir).await.unwrap();
+        assert!(tokio_fs_ext::metadata(&sentinel).await.is_err());
+
+        // Should overwrite and re-extract (idempotent)
+        let out = fs.extract_tgz_to_dir(&tgz_path).await.unwrap();
+        assert_eq!(out, out_dir);
+
+        // Sentinel now exists
+        assert!(tokio_fs_ext::metadata(&sentinel).await.is_ok());
+        // Files were extracted
+        assert!(tokio_fs_ext::metadata(&out.join("package.json")).await.is_ok());
+
+        // Cleanup
+        let _ = tokio_fs_ext::remove_dir_all(base).await;
     }
 }
