@@ -87,12 +87,7 @@ impl FuseFs {
         tokio_fs_ext::write(&fuse_link_path, link.to_content().as_bytes()).await?;
 
         if let Ok(mut cache) = self.link_cache.write() {
-            if cache.len() >= self.max_link_cache && !cache.contains_key(&fuse_link_path) {
-                let to_remove: Vec<_> = cache.keys().take(cache.len() / 2).cloned().collect();
-                for k in to_remove {
-                    cache.remove(&k);
-                }
-            }
+            self.ensure_cache_capacity(&mut cache, &fuse_link_path);
             cache.insert(fuse_link_path, link);
         } else {
             warn!("fuse link cache write lock poisoned");
@@ -182,13 +177,8 @@ impl FuseFs {
             target_dir: target_dir.to_path_buf(),
         });
         if let Ok(mut cache) = self.link_cache.write() {
-            if cache.len() >= self.max_link_cache && !cache.contains_key(&fuse_link_path) {
-                let to_remove: Vec<_> = cache.keys().take(cache.len() / 2).cloned().collect();
-                for k in to_remove {
-                    cache.remove(&k);
-                }
-            }
-            cache.insert(fuse_link_path, link);
+            self.ensure_cache_capacity(&mut cache, fuse_link_path);
+            cache.insert(fuse_link_path.to_path_buf(), link);
         }
     }
 
@@ -229,9 +219,7 @@ impl FuseFs {
             .await;
 
         // Propagate any write errors — do NOT write sentinel if extraction is incomplete
-        for result in results {
-            result?;
-        }
+        results.into_iter().collect::<Result<Vec<()>>>()?;
 
         // Mark extraction as complete
         tokio_fs_ext::write(&sentinel, b"").await?;
@@ -295,20 +283,24 @@ impl FuseFs {
             None => return Ok(None),
         };
 
-        // Populate cache — write lock (evict half when full, matching create_fuse_link)
+        // Populate cache — write lock
         if let Ok(mut cache) = self.link_cache.write() {
-            if cache.len() >= self.max_link_cache && !cache.contains_key(fuse_link_path) {
-                let to_remove: Vec<_> = cache.keys().take(cache.len() / 2).cloned().collect();
-                for k in to_remove {
-                    cache.remove(&k);
-                }
-            }
+            self.ensure_cache_capacity(&mut cache, fuse_link_path);
             cache.insert(fuse_link_path.to_path_buf(), Arc::clone(&link));
         }
 
         Ok(Some(link))
     }
 
+    /// Evict half the cache if it's full and the key is not already present.
+    fn ensure_cache_capacity(&self, cache: &mut HashMap<PathBuf, Arc<FuseLink>>, key: &Path) {
+        if cache.len() >= self.max_link_cache && !cache.contains_key(key) {
+            let to_remove: Vec<_> = cache.keys().take(cache.len() / 2).cloned().collect();
+            for k in to_remove {
+                cache.remove(&k);
+            }
+        }
+    }
 }
 
 /// Parse tgz bytes by streaming through tar entries.
