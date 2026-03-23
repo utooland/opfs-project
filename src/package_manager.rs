@@ -103,56 +103,50 @@ pub(crate) async fn install(
             .push(path.clone());
     }
 
-    // 2. Partition: cached vs needs download
+    // 2. Fetch all packages (cached or download) with integrity verification
     let store = project.store();
     let fuse = project.fuse_fs();
-    let mut cached = Vec::new();
-    let mut to_download = Vec::new();
+    let max_concurrent = opts
+        .max_concurrent_downloads
+        .unwrap_or(project.config().max_concurrent_downloads);
 
-    for group in groups.into_values() {
-        if store.is_cached(&group.name, &group.tgz_url).await {
-            let tgz_path = store.tgz_path(&group.name, &group.tgz_url);
-            cached.push((tgz_path, group.target_paths));
-        } else {
-            to_download.push(group);
+    let results: Vec<_> = stream::iter(groups.into_values().map(|g| {
+        let store = project.store();
+        async move {
+            store
+                .fetch_tgz(
+                    &g.name,
+                    &g.version,
+                    &g.tgz_url,
+                    g.integrity.as_deref(),
+                    g.shasum.as_deref(),
+                )
+                .await?;
+            Ok::<_, OpfsError>((g.name, g.tgz_url, g.target_paths))
         }
-    }
+    }))
+    .buffer_unordered(max_concurrent)
+    .collect()
+    .await;
 
-    // 3. Create fuse links for cached packages + warm caches
-    for (tgz_path, targets) in &cached {
-        link_and_warm_cache(fuse, tgz_path, targets).await?;
-    }
-
-    // 4. Download and link the rest
-    if !to_download.is_empty() {
-        let max_concurrent = opts
-            .max_concurrent_downloads
-            .unwrap_or(project.config().max_concurrent_downloads);
-
-        let results: Vec<_> = stream::iter(to_download.into_iter().map(|g| {
-            let store = project.store();
-            async move {
-                store
-                    .fetch_tgz(
-                        &g.name,
-                        &g.version,
-                        &g.tgz_url,
-                        g.integrity.as_deref(),
-                        g.shasum.as_deref(),
-                    )
-                    .await?;
-                Ok::<_, OpfsError>((g.name, g.tgz_url, g.target_paths))
+    // 3. Create fuse links for all successful fetches, collect errors
+    let mut first_error: Option<OpfsError> = None;
+    for result in results {
+        match result {
+            Ok((name, url, targets)) => {
+                let tgz_path = store.tgz_path(&name, &url);
+                link_and_warm_cache(fuse, &tgz_path, &targets).await?;
             }
-        }))
-        .buffer_unordered(max_concurrent)
-        .collect()
-        .await;
-
-        for result in results {
-            let (name, url, targets) = result?;
-            let tgz_path = store.tgz_path(&name, &url);
-            link_and_warm_cache(fuse, &tgz_path, &targets).await?;
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
         }
+    }
+
+    if let Some(e) = first_error {
+        return Err(e);
     }
 
     Ok(())

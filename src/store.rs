@@ -92,7 +92,7 @@ impl Store {
         let mut last_err = None;
         for attempt in 0..self.retries {
             if attempt > 0 {
-                let delay = self.retry_base_delay_ms * (1u64 << (attempt - 1));
+                let delay = self.retry_base_delay_ms.saturating_mul(1u64 << (attempt - 1).min(63));
                 wasmtimer::tokio::sleep(std::time::Duration::from_millis(delay)).await;
             }
             match self.download_once(url).await {

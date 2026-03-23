@@ -39,8 +39,14 @@ impl LockPackage {
         } else if path.is_empty() {
             "root".to_string()
         } else {
-            // Extract package name from path
-            path.rsplit('/').next().unwrap_or("unknown").to_string()
+            // Extract package name from path.
+            // Handle scoped packages: node_modules/@scope/pkg → @scope/pkg
+            let parts: Vec<&str> = path.rsplitn(3, '/').collect();
+            if parts.len() >= 2 && parts[1].starts_with('@') {
+                format!("{}/{}", parts[1], parts[0])
+            } else {
+                parts[0].to_string()
+            }
         }
     }
     /// Get package version
