@@ -177,7 +177,7 @@ impl FuseFs {
             target_dir: target_dir.to_path_buf(),
         });
         if let Ok(mut cache) = self.link_cache.write() {
-            self.ensure_cache_capacity(&mut cache, fuse_link_path);
+            self.ensure_cache_capacity(&mut cache, &fuse_link_path);
             cache.insert(fuse_link_path.to_path_buf(), link);
         }
     }
