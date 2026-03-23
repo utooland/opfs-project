@@ -209,6 +209,19 @@ impl FuseFs {
             }
 
             let path = entry.path()?.to_path_buf();
+
+            // Security: reject absolute paths and path traversal attempts
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("malicious path in tar entry: {}", path.display()),
+                ));
+            }
+
             // Strip the first component (e.g. "package/") from tar paths
             let normalized = if let Some(first) = path.components().next() {
                 let stripped = path.strip_prefix(first).unwrap_or(&path);
@@ -563,7 +576,7 @@ mod tests {
         
         use crate::archive::{gzip, PackFile};
         let mut files = Vec::new();
-        for i in 0..50 {
+        for i in 0..100 {
             files.push(PackFile::new(format!("package/file_{}.txt", i), format!("content {}", i).into_bytes()));
         }
         files.push(PackFile::new("package/nested/deep/file.js", b"console.log('deep')".to_vec()));
