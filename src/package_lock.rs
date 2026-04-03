@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Represents package information in package-lock.json
@@ -32,28 +33,34 @@ pub struct LockPackage {
 }
 
 impl LockPackage {
-    /// Get package name, infer from path if not available
-    pub fn get_name(&self, path: &str) -> String {
+    /// Get package name, infer from path if not available.
+    ///
+    /// Returns `Cow::Borrowed` when possible to avoid heap allocation
+    /// on hot paths (e.g. skipped packages during install).
+    pub fn get_name<'a>(&'a self, path: &'a str) -> Cow<'a, str> {
         if let Some(name) = &self.name {
-            name.clone()
+            Cow::Borrowed(name.as_str())
         } else if path.is_empty() {
-            "root".to_string()
+            Cow::Borrowed("root")
         } else {
             // Extract package name from path.
             // Handle scoped packages: node_modules/@scope/pkg → @scope/pkg
             let parts: Vec<&str> = path.rsplitn(3, '/').collect();
             if parts.len() >= 2 && parts[1].starts_with('@') {
-                format!("{}/{}", parts[1], parts[0])
+                Cow::Owned(format!("{}/{}", parts[1], parts[0]))
             } else {
-                parts[0].to_string()
+                Cow::Borrowed(parts[0])
             }
         }
     }
-    /// Get package version
-    pub fn get_version(&self) -> String {
-        self.version
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string())
+    /// Get package version.
+    ///
+    /// Returns `Cow::Borrowed` to avoid cloning on hot paths.
+    pub fn get_version(&self) -> Cow<'_, str> {
+        match &self.version {
+            Some(v) => Cow::Borrowed(v.as_str()),
+            None => Cow::Borrowed("unknown"),
+        }
     }
 }
 

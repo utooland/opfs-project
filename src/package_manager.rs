@@ -65,22 +65,16 @@ pub(crate) async fn install(
 
     for (path, pkg) in lock.packages.iter().filter(|(p, _)| !p.is_empty()) {
         if should_omit(pkg, omit) {
-            tracing::debug!("{}@{}: skipped", pkg.get_name(path), pkg.get_version());
             continue;
         }
 
         // Skip optional packages with platform constraints (binary, won't work in WASM)
         if pkg.optional == Some(true) && (pkg.os.is_some() || pkg.cpu.is_some()) {
-            tracing::debug!(
-                "{}@{}: skipped (platform-specific optional)",
-                pkg.get_name(path),
-                pkg.get_version()
-            );
             continue;
         }
 
-        let name = pkg.get_name(path);
-        let version = pkg.get_version();
+        let name = pkg.get_name(path).into_owned();
+        let version = pkg.get_version().into_owned();
         let tgz_url = match &pkg.resolved {
             Some(u) => u.clone(),
             None => {
@@ -110,37 +104,69 @@ pub(crate) async fn install(
         .max_concurrent_downloads
         .unwrap_or(project.config().max_concurrent_downloads);
 
-    let results: Vec<_> = stream::iter(groups.into_values().map(|g| {
-        let store = project.store();
-        async move {
-            store
-                .fetch_tgz(
-                    &g.name,
-                    &g.version,
-                    &g.tgz_url,
-                    g.integrity.as_deref(),
-                    g.shasum.as_deref(),
-                )
-                .await?;
-            Ok::<_, OpfsError>((g.name, g.tgz_url, g.target_paths))
-        }
+    // Issue #3: Reuse outer `store` reference — &Store is Copy, no need to
+    // re-borrow from project inside each closure.
+    let results: Vec<_> = stream::iter(groups.into_values().map(|g| async move {
+        let was_fresh = store
+            .ensure_tgz(
+                &g.name,
+                &g.version,
+                &g.tgz_url,
+                g.integrity.as_deref(),
+                g.shasum.as_deref(),
+            )
+            .await?;
+        Ok::<_, OpfsError>((g.name, g.tgz_url, g.target_paths, was_fresh))
     }))
     .buffer_unordered(max_concurrent)
     .collect()
     .await;
 
-    // 3. Create fuse links for all successful fetches, collect errors
+    // 3. Create fuse links **concurrently** for all successful fetches, collect errors.
+    //    (Issue #1: previously this was a serial loop — now uses buffer_unordered.)
     let mut first_error: Option<OpfsError> = None;
-    for result in results {
-        match result {
-            Ok((name, url, targets)) => {
-                let tgz_path = store.tgz_path(&name, &url);
-                link_and_warm_cache(fuse, &tgz_path, &targets).await?;
-            }
+
+    let successful: Vec<_> = results
+        .into_iter()
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
             Err(e) => {
                 if first_error.is_none() {
                     first_error = Some(e);
                 }
+                None
+            }
+        })
+        .collect();
+
+    let link_results: Vec<_> = stream::iter(
+        successful
+            .into_iter()
+            .map(|(name, url, targets, was_fresh)| {
+                let tgz_path = store.tgz_path(&name, &url);
+                async move {
+                    // If the tgz was re-downloaded (e.g. cached copy failed
+                    // integrity), delete the stale sentinel so that
+                    // extract_tgz_to_dir is forced to re-extract.
+                    if was_fresh {
+                        let sentinel = std::path::PathBuf::from(format!(
+                            "{}._resolved",
+                            tgz_path.with_extension("").display()
+                        ));
+                        let _ = tokio_fs_ext::remove_file(&sentinel).await;
+                    }
+                    link_and_warm_cache(fuse, &tgz_path, &targets).await
+                }
+            }),
+    )
+    .buffer_unordered(max_concurrent)
+    .collect()
+    .await;
+
+    for result in link_results {
+        if let Err(e) = result {
+            if first_error.is_none() {
+                first_error = Some(e);
             }
         }
     }
@@ -162,12 +188,20 @@ async fn link_and_warm_cache(
         .extract_tgz_to_dir(tgz_path)
         .await
         .map_err(|e| OpfsError::Other(format!("extract tgz: {e}")))?;
-    for target in targets {
-        let dst = std::path::PathBuf::from(target);
-        fuse.create_fuse_link(&extracted_dir, &dst)
-            .await
-            .map_err(|e| OpfsError::Other(format!("fuse link for {target}: {e}")))?;
-        fuse.warm_link_cache(&dst, &extracted_dir);
-    }
+
+    // Create all fuse links concurrently within this group.
+    futures::future::try_join_all(targets.iter().map(|target| {
+        let extracted_dir = &extracted_dir;
+        async move {
+            let dst = std::path::PathBuf::from(target);
+            fuse.create_fuse_link(extracted_dir, &dst)
+                .await
+                .map_err(|e| OpfsError::Other(format!("fuse link for {target}: {e}")))?;
+            fuse.warm_link_cache(&dst, extracted_dir);
+            Ok::<_, OpfsError>(())
+        }
+    }))
+    .await?;
+
     Ok(())
 }
