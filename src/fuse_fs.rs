@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Error, ErrorKind, Read, Result};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use flate2::read::GzDecoder;
@@ -108,13 +108,13 @@ impl BoundedCache {
 /// Uses a bounded FIFO cache to avoid repeated disk reads for fuse.link
 /// files. When the cache is full, the oldest entry is evicted.
 pub struct FuseFs {
-    link_cache: Mutex<BoundedCache>,
+    link_cache: RwLock<BoundedCache>,
 }
 
 impl FuseFs {
     pub fn new(fuse_cache_max_entries: usize) -> Self {
         Self {
-            link_cache: Mutex::new(BoundedCache::new(fuse_cache_max_entries)),
+            link_cache: RwLock::new(BoundedCache::new(fuse_cache_max_entries)),
         }
     }
 
@@ -145,7 +145,7 @@ impl FuseFs {
 
         tokio_fs_ext::write(&fuse_link_path, link.to_content().as_bytes()).await?;
 
-        if let Ok(mut cache) = self.link_cache.lock() {
+        if let Ok(mut cache) = self.link_cache.write() {
             cache.put(fuse_link_path, link);
         } else {
             warn!("fuse link cache lock poisoned");
@@ -242,7 +242,7 @@ impl FuseFs {
         let link = Arc::new(FuseLink {
             target_dir: target_dir.to_path_buf(),
         });
-        if let Ok(mut cache) = self.link_cache.lock() {
+        if let Ok(mut cache) = self.link_cache.write() {
             cache.put(fuse_link_path, link);
         }
     }
@@ -312,7 +312,7 @@ impl FuseFs {
                     continue;
                 }
 
-                let mut content = Vec::with_capacity(entry.size() as usize);
+                let mut content = Vec::new();
                 entry.read_to_end(&mut content)?;
 
                 let full_path = out_dir.join(normalized);
@@ -360,7 +360,7 @@ impl FuseFs {
 
     /// Clear the fuse-link cache.
     pub fn clear(&self) {
-        if let Ok(mut lc) = self.link_cache.lock() {
+        if let Ok(mut lc) = self.link_cache.write() {
             lc.clear();
         }
     }
@@ -396,7 +396,7 @@ impl FuseFs {
     /// Returns `Arc<FuseLink>` — cheap to clone (refcount bump only).
     async fn read_fuse_link(&self, fuse_link_path: &Path) -> Result<Option<Arc<FuseLink>>> {
         // Cache hit — lock briefly, then release
-        if let Ok(cache) = self.link_cache.lock() {
+        if let Ok(cache) = self.link_cache.read() {
             if let Some(link) = cache.get(fuse_link_path) {
                 return Ok(Some(Arc::clone(link)));
             }
@@ -416,7 +416,7 @@ impl FuseFs {
 
         // Populate cache — Issue #6: double-check to avoid redundant insert
         // if another task populated the cache concurrently.
-        if let Ok(mut cache) = self.link_cache.lock() {
+        if let Ok(mut cache) = self.link_cache.write() {
             if let Some(existing) = cache.get(fuse_link_path) {
                 return Ok(Some(Arc::clone(existing)));
             }
