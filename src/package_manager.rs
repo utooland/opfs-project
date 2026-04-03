@@ -65,17 +65,11 @@ pub(crate) async fn install(
 
     for (path, pkg) in lock.packages.iter().filter(|(p, _)| !p.is_empty()) {
         if should_omit(pkg, omit) {
-            tracing::debug!("{}@{}: skipped", pkg.get_name(path), pkg.get_version());
             continue;
         }
 
         // Skip optional packages with platform constraints (binary, won't work in WASM)
         if pkg.optional == Some(true) && (pkg.os.is_some() || pkg.cpu.is_some()) {
-            tracing::debug!(
-                "{}@{}: skipped (platform-specific optional)",
-                pkg.get_name(path),
-                pkg.get_version()
-            );
             continue;
         }
 
@@ -194,12 +188,20 @@ async fn link_and_warm_cache(
         .extract_tgz_to_dir(tgz_path)
         .await
         .map_err(|e| OpfsError::Other(format!("extract tgz: {e}")))?;
-    for target in targets {
-        let dst = std::path::PathBuf::from(target);
-        fuse.create_fuse_link(&extracted_dir, &dst)
-            .await
-            .map_err(|e| OpfsError::Other(format!("fuse link for {target}: {e}")))?;
-        fuse.warm_link_cache(&dst, &extracted_dir);
-    }
+
+    // Create all fuse links concurrently within this group.
+    futures::future::try_join_all(targets.iter().map(|target| {
+        let extracted_dir = &extracted_dir;
+        async move {
+            let dst = std::path::PathBuf::from(target);
+            fuse.create_fuse_link(extracted_dir, &dst)
+                .await
+                .map_err(|e| OpfsError::Other(format!("fuse link for {target}: {e}")))?;
+            fuse.warm_link_cache(&dst, extracted_dir);
+            Ok::<_, OpfsError>(())
+        }
+    }))
+    .await?;
+
     Ok(())
 }

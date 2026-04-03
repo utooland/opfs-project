@@ -122,6 +122,17 @@ impl FuseFs {
     pub async fn create_fuse_link(&self, target_dir: &Path, dst: &Path) -> Result<()> {
         let fuse_link_path = dst.join("fuse.link");
 
+        // Fast path: fuse.link already exists on disk — skip the write.
+        // Content is deterministic for a given package@version, so if it
+        // exists it must be correct (it was verified when first written).
+        if tokio_fs_ext::metadata(&fuse_link_path)
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
         // Ensure the destination directory exists
         let parent = fuse_link_path.parent().ok_or_else(|| {
             Error::new(ErrorKind::InvalidInput, "cannot determine fuse.link path")
