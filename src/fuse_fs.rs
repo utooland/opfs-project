@@ -4,10 +4,10 @@
 //! `node_modules/<pkg>/` directory. Its content points to an extracted
 //! directory in the store, enabling transparent reads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Error, ErrorKind, Read, Result};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use flate2::read::GzDecoder;
@@ -53,20 +53,68 @@ impl FuseLink {
 /// Max concurrent OPFS writes during tgz extraction.
 const EXTRACTION_CONCURRENCY: usize = 64;
 
+// ── BoundedCache ─────────────────────────────────────────────────────────
+
+/// A simple bounded cache with FIFO eviction.
+///
+/// Uses `HashMap` for O(1) lookups and `VecDeque` for insertion-order
+/// tracking. When the cache is full, the oldest entry is evicted.
+/// This replaces the previous random-eviction strategy without requiring
+/// an external crate.
+struct BoundedCache {
+    map: HashMap<PathBuf, Arc<FuseLink>>,
+    order: VecDeque<PathBuf>,
+    capacity: usize,
+}
+
+impl BoundedCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(capacity.min(256)),
+            order: VecDeque::with_capacity(capacity.min(256)),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn get(&self, key: &Path) -> Option<&Arc<FuseLink>> {
+        self.map.get(key)
+    }
+
+    fn put(&mut self, key: PathBuf, value: Arc<FuseLink>) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key, value);
+            return;
+        }
+        // Evict oldest if at capacity
+        if self.map.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, value);
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
+
 // ── FuseFs ───────────────────────────────────────────────────────────────
 
 /// Fuse-link aware filesystem overlay.
+///
+/// Uses a bounded FIFO cache to avoid repeated disk reads for fuse.link
+/// files. When the cache is full, the oldest entry is evicted.
 pub struct FuseFs {
-    /// Cache: fuse.link file path → parsed FuseLink (Arc to avoid cloning)
-    link_cache: RwLock<HashMap<PathBuf, Arc<FuseLink>>>,
-    max_link_cache: usize,
+    link_cache: Mutex<BoundedCache>,
 }
 
 impl FuseFs {
     pub fn new(fuse_cache_max_entries: usize) -> Self {
         Self {
-            link_cache: RwLock::new(HashMap::new()),
-            max_link_cache: fuse_cache_max_entries,
+            link_cache: Mutex::new(BoundedCache::new(fuse_cache_max_entries)),
         }
     }
 
@@ -86,11 +134,10 @@ impl FuseFs {
 
         tokio_fs_ext::write(&fuse_link_path, link.to_content().as_bytes()).await?;
 
-        if let Ok(mut cache) = self.link_cache.write() {
-            self.ensure_cache_capacity(&mut cache, &fuse_link_path);
-            cache.insert(fuse_link_path, link);
+        if let Ok(mut cache) = self.link_cache.lock() {
+            cache.put(fuse_link_path, link);
         } else {
-            warn!("fuse link cache write lock poisoned");
+            warn!("fuse link cache lock poisoned");
         }
         Ok(())
     }
@@ -127,14 +174,22 @@ impl FuseFs {
             Err(_) => return Ok(None),
         };
 
-        // Merge with any real files in the directory, deduplicating by name.
-        // Target entries (from extracted package) take priority.
+        // Issue #7: Merge with real files only when necessary. Most fuse-linked
+        // directories only contain `fuse.link`, making the full merge redundant.
         match read_dir_direct(path).await {
             Ok(original) => {
-                let target_names: std::collections::HashSet<_> = target_entries
+                // Fast path: check if any non-fuse.link entries exist
+                let has_extra_files = original
                     .iter()
-                    .map(|e| e.file_name())
-                    .collect();
+                    .any(|e| e.file_name().to_string_lossy() != "fuse.link");
+
+                if !has_extra_files {
+                    return Ok(Some(target_entries));
+                }
+
+                // Slow path: merge original entries with target entries
+                let target_names: HashSet<_> =
+                    target_entries.iter().map(|e| e.file_name()).collect();
                 let mut combined: Vec<_> = original
                     .into_iter()
                     .filter(|e| {
@@ -176,9 +231,8 @@ impl FuseFs {
         let link = Arc::new(FuseLink {
             target_dir: target_dir.to_path_buf(),
         });
-        if let Ok(mut cache) = self.link_cache.write() {
-            self.ensure_cache_capacity(&mut cache, &fuse_link_path);
-            cache.insert(fuse_link_path.to_path_buf(), link);
+        if let Ok(mut cache) = self.link_cache.lock() {
+            cache.put(fuse_link_path, link);
         }
     }
 
@@ -195,60 +249,84 @@ impl FuseFs {
             return Ok(out_dir);
         }
 
-        let raw = tokio_fs_ext::read(tgz_path).await?;
-        let gz = GzDecoder::new(&raw[..]);
-        let mut archive = Archive::new(gz);
+        // Issue #2 & #8: Phase 1 — Read all entries in a scoped block so that the
+        // raw tgz bytes (`raw`), `GzDecoder`, and `Archive` are dropped immediately
+        // after iteration, freeing compressed-data memory before the write phase.
+        // Also collect unique parent directories for batch creation (Issue #8).
+        struct PendingFile {
+            path: PathBuf,
+            content: Bytes,
+        }
+        let mut pending_files: Vec<PendingFile> = Vec::new();
+        let mut unique_dirs: HashSet<PathBuf> = HashSet::new();
 
+        {
+            let raw = tokio_fs_ext::read(tgz_path).await?;
+            let gz = GzDecoder::new(&raw[..]);
+            let mut archive = Archive::new(gz);
+
+            for entry_result in archive.entries()? {
+                let mut entry = entry_result?;
+                if !entry.header().entry_type().is_file() {
+                    continue;
+                }
+
+                let path = entry.path()?.to_path_buf();
+
+                // Security: reject absolute paths and path traversal attempts
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("malicious path in tar entry: {}", path.display()),
+                    ));
+                }
+
+                // Strip the first component (e.g. "package/") from tar paths
+                let normalized = if let Some(first) = path.components().next() {
+                    let stripped = path.strip_prefix(first).unwrap_or(&path);
+                    if stripped.as_os_str().is_empty() {
+                        path
+                    } else {
+                        stripped.to_path_buf()
+                    }
+                } else {
+                    path
+                };
+
+                if normalized.as_os_str().is_empty() {
+                    continue;
+                }
+
+                let mut content = Vec::with_capacity(entry.size() as usize);
+                entry.read_to_end(&mut content)?;
+
+                let full_path = out_dir.join(normalized);
+                if let Some(parent) = full_path.parent() {
+                    unique_dirs.insert(parent.to_path_buf());
+                }
+                pending_files.push(PendingFile {
+                    path: full_path,
+                    content: Bytes::from(content),
+                });
+            }
+        } // raw, gz, archive dropped here — frees tgz memory
+
+        // Phase 2 — Create all unique parent directories (Issue #8: deduplication
+        // avoids redundant create_dir_all calls for files in the same directory).
+        for dir in &unique_dirs {
+            tokio_fs_ext::create_dir_all(dir).await?;
+        }
+
+        // Phase 3 — Write files concurrently (no per-file create_dir_all needed).
         use futures::stream::{FuturesUnordered, StreamExt};
         let mut write_futures = FuturesUnordered::new();
 
-        for entry_result in archive.entries()? {
-            let mut entry = entry_result?;
-            if !entry.header().entry_type().is_file() {
-                continue;
-            }
-
-            let path = entry.path()?.to_path_buf();
-
-            // Security: reject absolute paths and path traversal attempts
-            if path.is_absolute()
-                || path
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    format!("malicious path in tar entry: {}", path.display()),
-                ));
-            }
-
-            // Strip the first component (e.g. "package/") from tar paths
-            let normalized = if let Some(first) = path.components().next() {
-                let stripped = path.strip_prefix(first).unwrap_or(&path);
-                if stripped.as_os_str().is_empty() {
-                    path
-                } else {
-                    stripped.to_path_buf()
-                }
-            } else {
-                path
-            };
-
-            if normalized.as_os_str().is_empty() {
-                continue;
-            }
-
-            let mut content = Vec::with_capacity(entry.size() as usize);
-            entry.read_to_end(&mut content)?;
-            let content = Bytes::from(content);
-
-            let full_path = out_dir.join(normalized);
-            write_futures.push(async move {
-                if let Some(parent) = full_path.parent() {
-                    tokio_fs_ext::create_dir_all(parent).await?;
-                }
-                tokio_fs_ext::write(&full_path, &content).await
-            });
+        for pf in pending_files {
+            write_futures.push(async move { tokio_fs_ext::write(&pf.path, &pf.content).await });
 
             // Keep concurrency in check
             if write_futures.len() >= EXTRACTION_CONCURRENCY {
@@ -271,7 +349,7 @@ impl FuseFs {
 
     /// Clear the fuse-link cache.
     pub fn clear(&self) {
-        if let Ok(mut lc) = self.link_cache.write() {
+        if let Ok(mut lc) = self.link_cache.lock() {
             lc.clear();
         }
     }
@@ -302,15 +380,15 @@ impl FuseFs {
         Ok(Some(Resolved { link, relative }))
     }
 
-    /// Read and parse a fuse.link file, using cache when available.
+    /// Read and parse a fuse.link file, using the bounded cache when available.
     ///
     /// Returns `Arc<FuseLink>` — cheap to clone (refcount bump only).
     async fn read_fuse_link(&self, fuse_link_path: &Path) -> Result<Option<Arc<FuseLink>>> {
-        // Cache hit — read lock only
-        if let Ok(cache) = self.link_cache.read()
-            && let Some(link) = cache.get(fuse_link_path)
-        {
-            return Ok(Some(Arc::clone(link)));
+        // Cache hit — lock briefly, then release
+        if let Ok(cache) = self.link_cache.lock() {
+            if let Some(link) = cache.get(fuse_link_path) {
+                return Ok(Some(Arc::clone(link)));
+            }
         }
 
         // Cache miss — read from disk.
@@ -325,23 +403,16 @@ impl FuseFs {
             None => return Ok(None),
         };
 
-        // Populate cache — write lock
-        if let Ok(mut cache) = self.link_cache.write() {
-            self.ensure_cache_capacity(&mut cache, fuse_link_path);
-            cache.insert(fuse_link_path.to_path_buf(), Arc::clone(&link));
+        // Populate cache — Issue #6: double-check to avoid redundant insert
+        // if another task populated the cache concurrently.
+        if let Ok(mut cache) = self.link_cache.lock() {
+            if let Some(existing) = cache.get(fuse_link_path) {
+                return Ok(Some(Arc::clone(existing)));
+            }
+            cache.put(fuse_link_path.to_path_buf(), Arc::clone(&link));
         }
 
         Ok(Some(link))
-    }
-
-    /// Evict half the cache if it's full and the key is not already present.
-    fn ensure_cache_capacity(&self, cache: &mut HashMap<PathBuf, Arc<FuseLink>>, key: &Path) {
-        if cache.len() >= self.max_link_cache && !cache.contains_key(key) {
-            let to_remove: Vec<_> = cache.keys().take(cache.len() / 2).cloned().collect();
-            for k in to_remove {
-                cache.remove(&k);
-            }
-        }
     }
 }
 
@@ -364,12 +435,16 @@ fn locate_fuse_link_file(path: &Path) -> Option<PathBuf> {
     use std::ffi::OsStr;
     use std::path::Component;
 
-    // Fast path: if the path doesn't contain "node_modules", there's no fuse link.
-    if !path.to_string_lossy().contains("node_modules") {
+    let node_modules = OsStr::new("node_modules");
+
+    // Issue #5: Fast path — use component iteration instead of
+    // `to_string_lossy().contains()` to avoid UTF-8 conversion + allocation.
+    if !path
+        .components()
+        .any(|c| matches!(c, Component::Normal(name) if name == node_modules))
+    {
         return None;
     }
-
-    let node_modules = OsStr::new("node_modules");
 
     // We only care about the last `node_modules` in the path.
     // e.g. /a/node_modules/b/node_modules/pkg/src/index.js -> we want `pkg`
@@ -507,7 +582,7 @@ mod tests {
 
     /// Helper: create a test tgz at the given path.
     async fn write_test_tgz(tgz_path: &Path) {
-        use crate::archive::{gzip, PackFile};
+        use crate::archive::{PackFile, gzip};
         let files = vec![
             PackFile::new("package/package.json", br#"{"name":"test"}"#.to_vec()),
             PackFile::new("package/index.js", b"module.exports = {}".to_vec()),
@@ -536,7 +611,11 @@ mod tests {
         assert!(tokio_fs_ext::metadata(&sentinel).await.is_ok());
 
         // Extracted files exist
-        assert!(tokio_fs_ext::metadata(&out.join("package.json")).await.is_ok());
+        assert!(
+            tokio_fs_ext::metadata(&out.join("package.json"))
+                .await
+                .is_ok()
+        );
         assert!(tokio_fs_ext::metadata(&out.join("index.js")).await.is_ok());
 
         // Cleanup
@@ -572,14 +651,20 @@ mod tests {
     async fn test_extract_tgz_complex() {
         let base = Path::new("/test_extract_complex");
         let tgz_path = base.join("complex-1.0.0.tgz");
-        
-        use crate::archive::{gzip, PackFile};
+
+        use crate::archive::{PackFile, gzip};
         let mut files = Vec::new();
         for i in 0..100 {
-            files.push(PackFile::new(format!("package/file_{}.txt", i), format!("content {}", i).into_bytes()));
+            files.push(PackFile::new(
+                format!("package/file_{}.txt", i),
+                format!("content {}", i).into_bytes(),
+            ));
         }
-        files.push(PackFile::new("package/nested/deep/file.js", b"console.log('deep')".to_vec()));
-        
+        files.push(PackFile::new(
+            "package/nested/deep/file.js",
+            b"console.log('deep')".to_vec(),
+        ));
+
         let tgz = gzip(&files).unwrap();
         let _ = tokio_fs_ext::create_dir_all(base).await;
         tokio_fs_ext::write(&tgz_path, &tgz).await.unwrap();
@@ -588,12 +673,30 @@ mod tests {
         let out = fs.extract_tgz_to_dir(&tgz_path).await.unwrap();
 
         // Check a few files
-        assert!(tokio_fs_ext::metadata(&out.join("file_0.txt")).await.is_ok());
-        assert!(tokio_fs_ext::metadata(&out.join("file_49.txt")).await.is_ok());
-        assert!(tokio_fs_ext::metadata(&out.join("file_99.txt")).await.is_ok());
-        assert!(tokio_fs_ext::metadata(&out.join("nested/deep/file.js")).await.is_ok());
+        assert!(
+            tokio_fs_ext::metadata(&out.join("file_0.txt"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            tokio_fs_ext::metadata(&out.join("file_49.txt"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            tokio_fs_ext::metadata(&out.join("file_99.txt"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            tokio_fs_ext::metadata(&out.join("nested/deep/file.js"))
+                .await
+                .is_ok()
+        );
 
-        let content = tokio_fs_ext::read_to_string(&out.join("nested/deep/file.js")).await.unwrap();
+        let content = tokio_fs_ext::read_to_string(&out.join("nested/deep/file.js"))
+            .await
+            .unwrap();
         assert_eq!(content, "console.log('deep')");
 
         // Cleanup
@@ -621,7 +724,11 @@ mod tests {
         // Sentinel now exists
         assert!(tokio_fs_ext::metadata(&sentinel).await.is_ok());
         // Files were extracted
-        assert!(tokio_fs_ext::metadata(&out.join("package.json")).await.is_ok());
+        assert!(
+            tokio_fs_ext::metadata(&out.join("package.json"))
+                .await
+                .is_ok()
+        );
 
         // Cleanup
         let _ = tokio_fs_ext::remove_dir_all(base).await;

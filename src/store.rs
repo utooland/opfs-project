@@ -39,7 +39,57 @@ impl Store {
             .unwrap_or(false)
     }
 
+    /// Ensure a tgz is on disk — download if missing.
+    ///
+    /// Unlike [`fetch_tgz`], this does **not** read or re-verify cached files.
+    /// The integrity was already checked when the file was first downloaded
+    /// and saved. This makes second installs O(1) per package (metadata check)
+    /// instead of O(n) (full file read + SHA-512).
+    ///
+    /// Returns `was_fresh` — `true` when the tgz was freshly downloaded
+    /// (i.e. it was not yet on disk). Callers should use this flag to
+    /// invalidate stale extraction caches.
+    pub async fn ensure_tgz(
+        &self,
+        name: &str,
+        version: &str,
+        tgz_url: &str,
+        integrity: Option<&str>,
+        shasum: Option<&str>,
+    ) -> Result<bool, OpfsError> {
+        let store_path = self.tgz_path(name, tgz_url);
+
+        // Fast path: file already exists on disk — trust it.
+        // Integrity was verified when first downloaded.
+        if tokio_fs_ext::metadata(&store_path)
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+
+        // Not cached — download, verify, and persist.
+        let bytes = self.download_with_retry(tgz_url).await?;
+
+        if archive::verify_integrity(&bytes, integrity, shasum).is_failed() {
+            return Err(OpfsError::IntegrityFailed {
+                package: name.to_string(),
+                version: version.to_string(),
+            });
+        }
+
+        self.save(&store_path, &bytes).await?;
+        Ok(true)
+    }
+
     /// Fetch a tgz — returns cached bytes if valid, otherwise downloads.
+    ///
+    /// Performs full integrity re-verification on cached files. Use
+    /// [`ensure_tgz`] when you only need the file on disk (e.g. install flow).
+    ///
+    /// Returns `(bytes, was_fresh)` where `was_fresh` is `true` when the tgz
+    /// was re-downloaded (e.g. because the cached copy failed integrity).
     pub async fn fetch_tgz(
         &self,
         name: &str,
@@ -47,14 +97,14 @@ impl Store {
         tgz_url: &str,
         integrity: Option<&str>,
         shasum: Option<&str>,
-    ) -> Result<Bytes, OpfsError> {
+    ) -> Result<(Bytes, bool), OpfsError> {
         let store_path = self.tgz_path(name, tgz_url);
 
-        // Try cached file
+        // Try cached file — full read + integrity verification
         if let Ok(existing) = tokio_fs_ext::read(&store_path).await {
             match archive::verify_integrity(&existing, integrity, shasum) {
                 VerifyResult::Verified | VerifyResult::NoHashAvailable => {
-                    return Ok(Bytes::from(existing));
+                    return Ok((Bytes::from(existing), false));
                 }
                 VerifyResult::Failed => {
                     tracing::warn!("{name}@{version}: cached tgz failed integrity, re-downloading");
@@ -75,7 +125,7 @@ impl Store {
 
         // Persist
         self.save(&store_path, &bytes).await?;
-        Ok(Bytes::from(bytes))
+        Ok((Bytes::from(bytes), true))
     }
 
     // ── private ──────────────────────────────────────────────────────

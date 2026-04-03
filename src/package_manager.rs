@@ -79,8 +79,8 @@ pub(crate) async fn install(
             continue;
         }
 
-        let name = pkg.get_name(path);
-        let version = pkg.get_version();
+        let name = pkg.get_name(path).into_owned();
+        let version = pkg.get_version().into_owned();
         let tgz_url = match &pkg.resolved {
             Some(u) => u.clone(),
             None => {
@@ -110,37 +110,69 @@ pub(crate) async fn install(
         .max_concurrent_downloads
         .unwrap_or(project.config().max_concurrent_downloads);
 
-    let results: Vec<_> = stream::iter(groups.into_values().map(|g| {
-        let store = project.store();
-        async move {
-            store
-                .fetch_tgz(
-                    &g.name,
-                    &g.version,
-                    &g.tgz_url,
-                    g.integrity.as_deref(),
-                    g.shasum.as_deref(),
-                )
-                .await?;
-            Ok::<_, OpfsError>((g.name, g.tgz_url, g.target_paths))
-        }
+    // Issue #3: Reuse outer `store` reference — &Store is Copy, no need to
+    // re-borrow from project inside each closure.
+    let results: Vec<_> = stream::iter(groups.into_values().map(|g| async move {
+        let was_fresh = store
+            .ensure_tgz(
+                &g.name,
+                &g.version,
+                &g.tgz_url,
+                g.integrity.as_deref(),
+                g.shasum.as_deref(),
+            )
+            .await?;
+        Ok::<_, OpfsError>((g.name, g.tgz_url, g.target_paths, was_fresh))
     }))
     .buffer_unordered(max_concurrent)
     .collect()
     .await;
 
-    // 3. Create fuse links for all successful fetches, collect errors
+    // 3. Create fuse links **concurrently** for all successful fetches, collect errors.
+    //    (Issue #1: previously this was a serial loop — now uses buffer_unordered.)
     let mut first_error: Option<OpfsError> = None;
-    for result in results {
-        match result {
-            Ok((name, url, targets)) => {
-                let tgz_path = store.tgz_path(&name, &url);
-                link_and_warm_cache(fuse, &tgz_path, &targets).await?;
-            }
+
+    let successful: Vec<_> = results
+        .into_iter()
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
             Err(e) => {
                 if first_error.is_none() {
                     first_error = Some(e);
                 }
+                None
+            }
+        })
+        .collect();
+
+    let link_results: Vec<_> = stream::iter(
+        successful
+            .into_iter()
+            .map(|(name, url, targets, was_fresh)| {
+                let tgz_path = store.tgz_path(&name, &url);
+                async move {
+                    // If the tgz was re-downloaded (e.g. cached copy failed
+                    // integrity), delete the stale sentinel so that
+                    // extract_tgz_to_dir is forced to re-extract.
+                    if was_fresh {
+                        let sentinel = std::path::PathBuf::from(format!(
+                            "{}._resolved",
+                            tgz_path.with_extension("").display()
+                        ));
+                        let _ = tokio_fs_ext::remove_file(&sentinel).await;
+                    }
+                    link_and_warm_cache(fuse, &tgz_path, &targets).await
+                }
+            }),
+    )
+    .buffer_unordered(max_concurrent)
+    .collect()
+    .await;
+
+    for result in link_results {
+        if let Err(e) = result {
+            if first_error.is_none() {
+                first_error = Some(e);
             }
         }
     }
