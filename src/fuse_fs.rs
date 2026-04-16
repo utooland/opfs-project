@@ -13,6 +13,7 @@ use bytes::Bytes;
 use flate2::read::GzDecoder;
 use tar::Archive;
 use tokio_fs_ext::DirEntry;
+use tracing::warn;
 
 // ── FuseLink (typed representation) ──────────────────────────────────────
 
@@ -139,6 +140,8 @@ impl FuseFs {
 
         if let Ok(mut cache) = self.link_cache.write() {
             cache.put(fuse_link_path, link);
+        } else {
+            warn!("fuse link cache lock poisoned");
         }
         Ok(())
     }
