@@ -132,7 +132,9 @@ impl FuseFs {
 
         let existing = tokio_fs_ext::read(&fuse_link_path).await.ok();
         if existing.as_deref() != Some(new_bytes.as_slice()) {
-            tokio_fs_ext::create_dir_all(dst).await?;
+            if existing.is_none() {
+                tokio_fs_ext::create_dir_all(dst).await?;
+            }
             tokio_fs_ext::write(&fuse_link_path, &new_bytes).await?;
         }
 
