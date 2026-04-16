@@ -128,14 +128,14 @@ impl FuseFs {
         let link = Arc::new(FuseLink {
             target_dir: target_dir.to_path_buf(),
         });
-        let new_bytes = link.to_content().into_bytes();
+        let link_content = link.to_content();
 
         let existing = tokio_fs_ext::read(&fuse_link_path).await.ok();
         if existing.is_none() {
             tokio_fs_ext::create_dir_all(dst).await?;
         }
-        if existing.as_deref() != Some(new_bytes.as_slice()) {
-            tokio_fs_ext::write(&fuse_link_path, &new_bytes).await?;
+        if existing.as_deref() != Some(link_content.as_bytes()) {
+            tokio_fs_ext::write(&fuse_link_path, &link_content).await?;
         }
 
         if let Ok(mut cache) = self.link_cache.write() {
