@@ -119,31 +119,25 @@ impl FuseFs {
     }
 
     /// Create a fuse link: write `fuse.link` under `dst` pointing to `target_dir`.
+    ///
+    /// Skips the write when existing content already matches (e.g. re-install
+    /// of same version). The cache is always refreshed so callers never
+    /// observe a stale link after this returns, even on eviction.
     pub async fn create_fuse_link(&self, target_dir: &Path, dst: &Path) -> Result<()> {
         let fuse_link_path = dst.join("fuse.link");
-
-        // Fast path: fuse.link already exists on disk — skip the write.
-        // Content is deterministic for a given package@version, so if it
-        // exists it must be correct (it was verified when first written).
-        if tokio_fs_ext::metadata(&fuse_link_path)
-            .await
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-        {
-            return Ok(());
-        }
-
-        // Ensure the destination directory exists
-        let parent = fuse_link_path.parent().ok_or_else(|| {
-            Error::new(ErrorKind::InvalidInput, "cannot determine fuse.link path")
-        })?;
-        tokio_fs_ext::create_dir_all(parent).await?;
-
         let link = Arc::new(FuseLink {
             target_dir: target_dir.to_path_buf(),
         });
+        let new_content = link.to_content();
 
-        tokio_fs_ext::write(&fuse_link_path, link.to_content().as_bytes()).await?;
+        let existing = tokio_fs_ext::read_to_string(&fuse_link_path).await.ok();
+        if existing.as_deref() != Some(new_content.as_str()) {
+            let parent = fuse_link_path.parent().ok_or_else(|| {
+                Error::new(ErrorKind::InvalidInput, "cannot determine fuse.link path")
+            })?;
+            tokio_fs_ext::create_dir_all(parent).await?;
+            tokio_fs_ext::write(&fuse_link_path, new_content.as_bytes()).await?;
+        }
 
         if let Ok(mut cache) = self.link_cache.write() {
             cache.put(fuse_link_path, link);
@@ -742,6 +736,59 @@ mod tests {
         );
 
         // Cleanup
+        let _ = tokio_fs_ext::remove_dir_all(base).await;
+    }
+
+    fn cached_target(fs: &FuseFs, path: &Path) -> Option<PathBuf> {
+        fs.link_cache
+            .read()
+            .ok()?
+            .get(path)
+            .map(|arc| arc.target_dir.clone())
+    }
+
+    /// Scenario: package-lock.json upgrades lodash 4.0.0 -> 4.0.1.
+    ///
+    /// `dst` (node_modules/lodash) stays the same across versions, only
+    /// `target_dir` changes. `create_fuse_link` must rewrite the stale
+    /// link and refresh the cache so future reads resolve to 4.0.1.
+    #[wasm_bindgen_test]
+    async fn test_create_fuse_link_upgrade_rewrites_on_content_change() {
+        let base = Path::new("/test_fuse_link_upgrade");
+        let dst = base.join("node_modules/lodash");
+        let fuse_link_path = dst.join("fuse.link");
+        let target_v0 = PathBuf::from("/stores/lodash/-/lodash-4.0.0");
+        let target_v1 = PathBuf::from("/stores/lodash/-/lodash-4.0.1");
+
+        let fs = FuseFs::new(100);
+
+        fs.create_fuse_link(&target_v0, &dst).await.unwrap();
+        let content_v0 = tokio_fs_ext::read_to_string(&fuse_link_path).await.unwrap();
+        assert_eq!(FuseLink::parse(&content_v0).unwrap().target_dir, target_v0);
+        assert_eq!(cached_target(&fs, &fuse_link_path), Some(target_v0.clone()));
+
+        fs.create_fuse_link(&target_v1, &dst).await.unwrap();
+        let content_v1 = tokio_fs_ext::read_to_string(&fuse_link_path).await.unwrap();
+        assert_eq!(
+            FuseLink::parse(&content_v1).unwrap().target_dir,
+            target_v1,
+            "fuse.link on disk not updated on upgrade"
+        );
+        assert_eq!(
+            cached_target(&fs, &fuse_link_path),
+            Some(target_v1.clone()),
+            "link cache still points at stale 4.0.0 after upgrade"
+        );
+
+        fs.create_fuse_link(&target_v1, &dst).await.unwrap();
+        let content_again = tokio_fs_ext::read_to_string(&fuse_link_path).await.unwrap();
+        assert_eq!(content_again, content_v1);
+
+        // Fast path must re-warm the cache even when it skips the disk write.
+        fs.link_cache.write().unwrap().clear();
+        fs.create_fuse_link(&target_v1, &dst).await.unwrap();
+        assert_eq!(cached_target(&fs, &fuse_link_path), Some(target_v1));
+
         let _ = tokio_fs_ext::remove_dir_all(base).await;
     }
 }
