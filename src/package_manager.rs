@@ -5,6 +5,7 @@
 //! [`FuseFs`]. All I/O is delegated to those subsystems.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use futures::stream::{self, StreamExt};
 
@@ -39,6 +40,14 @@ struct PackageGroup {
     integrity: Option<String>,
     shasum: Option<String>,
     target_paths: Vec<String>,
+}
+
+struct FetchedPackage {
+    name: String,
+    version: String,
+    tgz_url: String,
+    target_paths: Vec<String>,
+    was_fresh: bool,
 }
 
 fn should_omit(pkg: &LockPackage, omit: &[OmitType]) -> bool {
@@ -116,7 +125,13 @@ pub(crate) async fn install(
                 g.shasum.as_deref(),
             )
             .await?;
-        Ok::<_, OpfsError>((g.name, g.tgz_url, g.target_paths, was_fresh))
+        Ok::<_, OpfsError>(FetchedPackage {
+            name: g.name,
+            version: g.version,
+            tgz_url: g.tgz_url,
+            target_paths: g.target_paths,
+            was_fresh,
+        })
     }))
     .buffer_unordered(max_concurrent)
     .collect()
@@ -139,26 +154,22 @@ pub(crate) async fn install(
         })
         .collect();
 
-    let link_results: Vec<_> = stream::iter(
-        successful
-            .into_iter()
-            .map(|(name, url, targets, was_fresh)| {
-                let tgz_path = store.tgz_path(&name, &url);
-                async move {
-                    // If the tgz was re-downloaded (e.g. cached copy failed
-                    // integrity), delete the stale sentinel so that
-                    // extract_tgz_to_dir is forced to re-extract.
-                    if was_fresh {
-                        let sentinel = std::path::PathBuf::from(format!(
-                            "{}._resolved",
-                            tgz_path.with_extension("").display()
-                        ));
-                        let _ = tokio_fs_ext::remove_file(&sentinel).await;
-                    }
-                    link_and_warm_cache(fuse, &tgz_path, &targets).await
-                }
-            }),
-    )
+    let link_results: Vec<_> = stream::iter(successful.into_iter().map(|package| {
+        let tgz_path = store.tgz_path(&package.name, &package.tgz_url);
+        async move {
+            // If the tgz was re-downloaded (e.g. cached copy failed
+            // integrity), delete the stale sentinel so that
+            // extract_tgz_to_dir is forced to re-extract.
+            if package.was_fresh {
+                let sentinel = std::path::PathBuf::from(format!(
+                    "{}._resolved",
+                    tgz_path.with_extension("").display()
+                ));
+                let _ = tokio_fs_ext::remove_file(&sentinel).await;
+            }
+            link_and_warm_cache(fuse, &package, &tgz_path).await
+        }
+    }))
     .buffer_unordered(max_concurrent)
     .collect()
     .await;
@@ -181,16 +192,16 @@ pub(crate) async fn install(
 /// Create fuse links and warm the cache for a set of target paths.
 async fn link_and_warm_cache(
     fuse: &crate::fuse_fs::FuseFs,
-    tgz_path: &std::path::Path,
-    targets: &[String],
+    package: &FetchedPackage,
+    tgz_path: &Path,
 ) -> std::result::Result<(), OpfsError> {
-    let extracted_dir = fuse
-        .extract_tgz_to_dir(tgz_path)
-        .await
-        .map_err(|e| OpfsError::Other(format!("extract tgz: {e}")))?;
+    let extracted_dir = match fuse.extract_tgz_to_dir(tgz_path).await {
+        Ok(dir) => dir,
+        Err(e) => return Err(extract_tgz_error(package, tgz_path, e).await),
+    };
 
     // Create all fuse links concurrently within this group.
-    futures::future::try_join_all(targets.iter().map(|target| {
+    futures::future::try_join_all(package.target_paths.iter().map(|target| {
         let extracted_dir = &extracted_dir;
         async move {
             let dst = std::path::PathBuf::from(target);
@@ -204,4 +215,30 @@ async fn link_and_warm_cache(
     .await?;
 
     Ok(())
+}
+
+async fn extract_tgz_error(
+    package: &FetchedPackage,
+    tgz_path: &Path,
+    source: std::io::Error,
+) -> OpfsError {
+    // Best-effort current size. Another tab may change the file after the
+    // extraction failure, so this is diagnostic context rather than a strict
+    // read-time measurement.
+    let current_bytes = tokio_fs_ext::metadata(tgz_path)
+        .await
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len());
+
+    OpfsError::Other(format!(
+        "extract tgz failed for {}@{} (url={}, path={}, current_bytes={:?}, targets={}, was_fresh={}): {source}",
+        package.name,
+        package.version,
+        package.tgz_url,
+        tgz_path.display(),
+        current_bytes,
+        package.target_paths.len(),
+        package.was_fresh
+    ))
 }
