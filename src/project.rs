@@ -183,7 +183,7 @@ mod tests {
                 "/project/node_modules/pkg/dist/esm/packages/runtime/es/common/request/middleware/../../../../runtime-shared/node_modules/eventemitter3/index.js"
             )),
             PathBuf::from(
-                "/project/node_modules/pkg/dist/esm/packages/runtime-shared/node_modules/eventemitter3/index.js"
+                "/project/node_modules/pkg/dist/esm/packages/runtime/runtime-shared/node_modules/eventemitter3/index.js"
             )
         );
     }
@@ -194,8 +194,8 @@ mod tests {
         let package_dir = base.join("node_modules/ad-runtime-integration-h5ap");
         let target_dir = base.join("stores/ad-runtime-integration-h5ap-4.26.12");
         let tslib_file = target_dir.join("dist/esm/node_modules/tslib/tslib.es6.js");
-        let eventemitter_file =
-            target_dir.join("dist/esm/packages/runtime-shared/node_modules/eventemitter3/index.js");
+        let eventemitter_file = target_dir
+            .join("dist/esm/packages/runtime/runtime-shared/node_modules/eventemitter3/index.js");
         let tslib_import_path = package_dir.join(
             "dist/esm/packages/runtime/es/common/request/middleware/../../../../../../node_modules/tslib/tslib.es6.js",
         );
