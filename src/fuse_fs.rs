@@ -362,26 +362,25 @@ impl FuseFs {
 
     /// Resolve a path to its fuse-link target (if one exists).
     async fn resolve(&self, path: &Path) -> Result<Option<Resolved>> {
-        let fuse_link_path = match locate_fuse_link_file(path) {
-            Some(p) => p,
-            None => return Ok(None),
-        };
+        for fuse_link_path in locate_fuse_link_files(path) {
+            let link = match self.read_fuse_link(&fuse_link_path).await? {
+                Some(l) => l,
+                None => continue,
+            };
 
-        let link = match self.read_fuse_link(&fuse_link_path).await? {
-            Some(l) => l,
-            None => return Ok(None),
-        };
+            let fuse_dir = fuse_link_path
+                .parent()
+                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "invalid fuse.link path"))?;
 
-        let fuse_dir = fuse_link_path
-            .parent()
-            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "invalid fuse.link path"))?;
+            let relative = path
+                .strip_prefix(fuse_dir)
+                .map_err(|_| Error::new(ErrorKind::InvalidInput, "path not under fuse.link dir"))?
+                .to_path_buf();
 
-        let relative = path
-            .strip_prefix(fuse_dir)
-            .map_err(|_| Error::new(ErrorKind::InvalidInput, "path not under fuse.link dir"))?
-            .to_path_buf();
+            return Ok(Some(Resolved { link, relative }));
+        }
 
-        Ok(Some(Resolved { link, relative }))
+        Ok(None)
     }
 
     /// Read and parse a fuse.link file, using the bounded cache when available.
@@ -431,11 +430,17 @@ struct Resolved {
 
 // ── path helpers ─────────────────────────────────────────────────────────
 
-/// Walk up from `path` to find the `node_modules/<pkg>/fuse.link` path.
-///
-/// Low-allocation: uses a small `Vec<&OsStr>` for component tracking,
-/// only allocates the final `PathBuf` result.
+/// Walk up from `path` to find the deepest `node_modules/<pkg>/fuse.link` path.
 fn locate_fuse_link_file(path: &Path) -> Option<PathBuf> {
+    locate_fuse_link_files(path).into_iter().next()
+}
+
+/// Return candidate `node_modules/<pkg>/fuse.link` paths from deepest to shallowest.
+///
+/// Packages can ship their own `node_modules` directories inside the tarball.
+/// Those directories do not have virtual `fuse.link` files, so resolution needs
+/// to fall back to the outer package link after probing the deepest candidate.
+fn locate_fuse_link_files(path: &Path) -> Vec<PathBuf> {
     use std::ffi::OsStr;
     use std::path::Component;
 
@@ -447,51 +452,47 @@ fn locate_fuse_link_file(path: &Path) -> Option<PathBuf> {
         .components()
         .any(|c| matches!(c, Component::Normal(name) if name == node_modules))
     {
-        return None;
+        return Vec::new();
     }
 
-    // We only care about the last `node_modules` in the path.
-    // e.g. /a/node_modules/b/node_modules/pkg/src/index.js -> we want `pkg`
-    let mut comps = path.components();
-    let mut pkg_components: Vec<&OsStr> = Vec::new();
+    let components: Vec<Component<'_>> = path.components().collect();
+    let mut candidates = Vec::new();
 
-    // Iterate backwards. As soon as we hit `node_modules`, the components we
-    // just traversed *must* contain the package name at the front.
-    while let Some(comp) = comps.next_back() {
-        if let Component::Normal(name) = comp {
-            if name == node_modules {
-                // We found `node_modules`. Now look at the components that came after it.
-                // Because we traversed backwards, pkg_components is reversed.
-                // The actual package name is at the *end* of pkg_components.
-                if let Some(pkg) = pkg_components.last().copied() {
-                    let pkg_str = pkg.to_string_lossy();
-                    if pkg_str.starts_with('@') {
-                        // Scoped: it needs 2 components (@scope and pkg name)
-                        if pkg_components.len() >= 2 {
-                            let scope = pkg;
-                            let name = pkg_components[pkg_components.len() - 2];
-                            let mut base = comps.as_path().to_path_buf();
-                            base.push("node_modules");
-                            base.push(scope);
-                            base.push(name);
-                            base.push("fuse.link");
-                            return Some(base);
-                        }
-                    } else if pkg_str != "fuse.link" {
-                        // Unscoped: 1 component (skip fuse.link itself)
-                        let mut base = comps.as_path().to_path_buf();
-                        base.push("node_modules");
-                        base.push(pkg);
-                        base.push("fuse.link");
-                        return Some(base);
-                    }
-                }
-            } else {
-                pkg_components.push(name);
-            }
+    for (idx, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        if *name != node_modules {
+            continue;
         }
+
+        let Some(Component::Normal(pkg)) = components.get(idx + 1) else {
+            continue;
+        };
+
+        let pkg_str = pkg.to_string_lossy();
+        let package_end = if pkg_str.starts_with('@') {
+            if matches!(components.get(idx + 2), Some(Component::Normal(_))) {
+                idx + 2
+            } else {
+                continue;
+            }
+        } else if pkg_str != "fuse.link" {
+            idx + 1
+        } else {
+            continue;
+        };
+
+        let mut candidate = PathBuf::new();
+        for component in &components[..=package_end] {
+            candidate.push(component.as_os_str());
+        }
+        candidate.push("fuse.link");
+        candidates.push(candidate);
     }
-    None
+
+    candidates.reverse();
+    candidates
 }
 
 /// Read directory directly (no fuse-link logic).
@@ -563,6 +564,19 @@ mod tests {
         assert_eq!(
             locate_fuse_link_file(Path::new("./node_modules/a/node_modules/b/lib/index.js")),
             Some(PathBuf::from("./node_modules/a/node_modules/b/fuse.link"))
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_locate_fuse_link_files_deepest_to_shallowest() {
+        assert_eq!(
+            locate_fuse_link_files(Path::new(
+                "./node_modules/ad-runtime/dist/esm/node_modules/tslib/tslib.es6.js"
+            )),
+            vec![
+                PathBuf::from("./node_modules/ad-runtime/dist/esm/node_modules/tslib/fuse.link"),
+                PathBuf::from("./node_modules/ad-runtime/fuse.link"),
+            ]
         );
     }
 
@@ -787,6 +801,91 @@ mod tests {
         fs.link_cache.write().unwrap().clear();
         fs.create_fuse_link(&target_v1, &dst).await.unwrap();
         assert_eq!(cached_target(&fs, &fuse_link_path), Some(target_v1));
+
+        let _ = tokio_fs_ext::remove_dir_all(base).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_try_read_falls_back_to_outer_link_for_bundled_node_modules() {
+        let base = Path::new("/test_fuse_bundled_node_modules");
+        let dst = base.join("node_modules/ad-runtime");
+        let target = base.join("stores/ad-runtime-1.0.0");
+        let bundled_file = target.join("dist/esm/node_modules/tslib/tslib.es6.js");
+        let virtual_file = dst.join("dist/esm/node_modules/tslib/tslib.es6.js");
+
+        let _ = tokio_fs_ext::remove_dir_all(base).await;
+        tokio_fs_ext::create_dir_all(bundled_file.parent().unwrap())
+            .await
+            .unwrap();
+        tokio_fs_ext::write(&bundled_file, b"export var __generator = 1;")
+            .await
+            .unwrap();
+
+        let fs = FuseFs::new(100);
+        fs.create_fuse_link(&target, &dst).await.unwrap();
+
+        let content = fs.try_read(&virtual_file).await.unwrap().unwrap();
+        assert_eq!(&content[..], b"export var __generator = 1;");
+
+        let _ = tokio_fs_ext::remove_dir_all(base).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_try_read_top_level_link_unchanged() {
+        let base = Path::new("/test_fuse_top_level_read");
+        let dst = base.join("node_modules/plain-package");
+        let target = base.join("stores/plain-package-1.0.0");
+        let target_file = target.join("index.js");
+        let virtual_file = dst.join("index.js");
+
+        let _ = tokio_fs_ext::remove_dir_all(base).await;
+        tokio_fs_ext::create_dir_all(&target).await.unwrap();
+        tokio_fs_ext::write(&target_file, b"export default 'plain';")
+            .await
+            .unwrap();
+
+        let fs = FuseFs::new(100);
+        fs.create_fuse_link(&target, &dst).await.unwrap();
+
+        let content = fs.try_read(&virtual_file).await.unwrap().unwrap();
+        assert_eq!(&content[..], b"export default 'plain';");
+
+        let _ = tokio_fs_ext::remove_dir_all(base).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_try_read_prefers_nested_link_over_outer_link() {
+        let base = Path::new("/test_fuse_nested_link_precedence");
+        let outer_dst = base.join("node_modules/outer-package");
+        let outer_target = base.join("stores/outer-package-1.0.0");
+        let nested_dst = outer_dst.join("node_modules/nested-package");
+        let nested_target = base.join("stores/nested-package-1.0.0");
+        let bundled_file = outer_target.join("node_modules/nested-package/index.js");
+        let nested_file = nested_target.join("index.js");
+        let virtual_file = nested_dst.join("index.js");
+
+        let _ = tokio_fs_ext::remove_dir_all(base).await;
+        tokio_fs_ext::create_dir_all(bundled_file.parent().unwrap())
+            .await
+            .unwrap();
+        tokio_fs_ext::create_dir_all(&nested_target).await.unwrap();
+        tokio_fs_ext::write(&bundled_file, b"export default 'outer';")
+            .await
+            .unwrap();
+        tokio_fs_ext::write(&nested_file, b"export default 'nested';")
+            .await
+            .unwrap();
+
+        let fs = FuseFs::new(100);
+        fs.create_fuse_link(&outer_target, &outer_dst)
+            .await
+            .unwrap();
+        fs.create_fuse_link(&nested_target, &nested_dst)
+            .await
+            .unwrap();
+
+        let content = fs.try_read(&virtual_file).await.unwrap().unwrap();
+        assert_eq!(&content[..], b"export default 'nested';");
 
         let _ = tokio_fs_ext::remove_dir_all(base).await;
     }
