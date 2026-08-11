@@ -1,7 +1,7 @@
 //! Central project struct that owns all state.
 
 use std::io::Result;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use bytes::Bytes;
 use tokio_fs_ext::DirEntry;
@@ -59,7 +59,7 @@ impl OpfsProject {
     // ── path preparation ─────────────────────────────────────────────
 
     fn prepare_path(&self, path: &Path) -> PathBuf {
-        if path.starts_with("/") {
+        let prepared = if path.is_absolute() {
             path.to_path_buf()
         } else {
             let cwd = self.cwd();
@@ -68,7 +68,8 @@ impl OpfsProject {
             } else {
                 cwd.join(path)
             }
-        }
+        };
+        lexical_normalize(&prepared)
     }
 
     // ── fuse-aware reads ─────────────────────────────────────────────
@@ -130,5 +131,105 @@ impl OpfsProject {
 
     pub fn fuse_fs(&self) -> &FuseFs {
         &self.fuse_fs
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::ParentDir) | None => normalized.push(".."),
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                Some(Component::CurDir) => {}
+            },
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        if path.is_absolute() {
+            PathBuf::from("/")
+        } else {
+            PathBuf::from(".")
+        }
+    } else {
+        normalized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    #[wasm_bindgen_test]
+    fn test_lexical_normalize_collapses_relative_segments() {
+        assert_eq!(
+            lexical_normalize(Path::new(
+                "/project/node_modules/pkg/dist/esm/packages/runtime/es/common/request/middleware/../../../../../../node_modules/tslib/tslib.es6.js"
+            )),
+            PathBuf::from("/project/node_modules/pkg/dist/esm/node_modules/tslib/tslib.es6.js")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new(
+                "/project/node_modules/pkg/dist/esm/packages/runtime/es/common/request/middleware/../../../../runtime-shared/node_modules/eventemitter3/index.js"
+            )),
+            PathBuf::from(
+                "/project/node_modules/pkg/dist/esm/packages/runtime-shared/node_modules/eventemitter3/index.js"
+            )
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_read_bundled_node_modules_via_parent_relative_import() {
+        let base = Path::new("/test_read_bundled_node_modules");
+        let package_dir = base.join("node_modules/ad-runtime-integration-h5ap");
+        let target_dir = base.join("stores/ad-runtime-integration-h5ap-4.26.12");
+        let tslib_file = target_dir.join("dist/esm/node_modules/tslib/tslib.es6.js");
+        let eventemitter_file =
+            target_dir.join("dist/esm/packages/runtime-shared/node_modules/eventemitter3/index.js");
+        let tslib_import_path = package_dir.join(
+            "dist/esm/packages/runtime/es/common/request/middleware/../../../../../../node_modules/tslib/tslib.es6.js",
+        );
+        let eventemitter_import_path = package_dir.join(
+            "dist/esm/packages/runtime/es/common/request/middleware/../../../../runtime-shared/node_modules/eventemitter3/index.js",
+        );
+
+        let _ = tokio_fs_ext::remove_dir_all(base).await;
+        tokio_fs_ext::create_dir_all(tslib_file.parent().unwrap())
+            .await
+            .unwrap();
+        tokio_fs_ext::create_dir_all(eventemitter_file.parent().unwrap())
+            .await
+            .unwrap();
+        tokio_fs_ext::write(&tslib_file, b"export var __awaiter = 1;")
+            .await
+            .unwrap();
+        tokio_fs_ext::write(&eventemitter_file, b"export default EventEmitter;")
+            .await
+            .unwrap();
+
+        let project = OpfsProject::default();
+        project
+            .fuse_fs()
+            .create_fuse_link(&target_dir, &package_dir)
+            .await
+            .unwrap();
+
+        let tslib_content = project.read(&tslib_import_path).await.unwrap();
+        assert_eq!(&tslib_content[..], b"export var __awaiter = 1;");
+
+        let eventemitter_content = project.read(&eventemitter_import_path).await.unwrap();
+        assert_eq!(&eventemitter_content[..], b"export default EventEmitter;");
+
+        let _ = tokio_fs_ext::remove_dir_all(base).await;
     }
 }
